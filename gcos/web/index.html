@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GCOS — Garbage Collector OS</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>GCOS <span class="subtitle">Garbage Collector OS for LLM</span></h1>
+    <div id="status-bar">
+      <span class="stat">scheduler: <b id="stat-scheduler">-</b></span>
+      <span class="stat">workers: <b id="stat-workers">-</b></span>
+      <span class="stat">busy: <b id="stat-busy">-</b></span>
+      <span class="stat">queue: <b id="stat-queue">-</b></span>
+      <span class="stat">agents: <b id="stat-total">-</b></span>
+      <span class="stat">
+        quota:
+        <b id="stat-quota">-</b> / <span id="stat-quota-total">-</span>
+        <button id="topup-btn">+25</button>
+      </span>
+      <span class="stat">batcher: <b id="stat-batcher">-</b></span>
+    </div>
+  </header>
+
+  <section id="spawn-section">
+    <h2>spawn agent</h2>
+    <form id="spawn-form">
+      <input type="text" id="prompt" placeholder="prompt" required />
+      <input type="text" id="name" placeholder="name" value="anon" />
+      <label>prio
+        <input type="number" id="priority" value="5" min="0" max="9" />
+      </label>
+      <label>quota
+        <input type="number" id="quota" value="3" min="1" />
+      </label>
+      <button type="submit">spawn</button>
+    </form>
+  </section>
+
+  <section id="process-section">
+    <h2>process table <span class="hint">(refreshes every 1s)</span></h2>
+    <table id="agents-table">
+      <thead>
+        <tr>
+          <th>PID</th>
+          <th>name</th>
+          <th>state</th>
+          <th>prio</th>
+          <th>parent</th>
+          <th>quota</th>
+          <th>calls</th>
+          <th>tokens</th>
+          <th>wall</th>
+          <th>result / error</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="agents-body"></tbody>
+    </table>
+  </section>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
