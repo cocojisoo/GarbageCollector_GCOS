@@ -28,23 +28,22 @@ def _kernel(workers=2):
 
 def test_producer_pipes_to_consumer_with_input_placeholder():
     with _kernel() as k:
-        consumer_pid_holder = []
+        # Wire pipe_to AND input_from atomically *before* either agent runs,
+        # mirroring the real pipeline command (gcos.main.cmd_pipeline): peek the
+        # producer's PID, derive the consumer's, then spawn both with their
+        # links already set so the consumer starts in WAITING.
+        #
+        # The previous version spawned the consumer with input_from=None and
+        # set it *after* spawning the producer. That raced a worker thread,
+        # which could pick the consumer up while input_from was still None and
+        # run it with the {INPUT} placeholder unresolved (flaky ~50% failure).
+        producer_pid = k.pids.peek()
+        consumer_pid = producer_pid + 1
 
-        # Spawn consumer first so it has a known PID, then producer with pipe_to.
+        producer_pid = k.spawn("PRODUCED", name="producer", pipe_to=consumer_pid)
         consumer_pid = k.spawn(
-            "use upstream: {INPUT}",
-            name="consumer",
-            input_from=None,  # will be set after producer
+            "use upstream: {INPUT}", name="consumer", input_from=producer_pid,
         )
-        consumer_pid_holder.append(consumer_pid)
-        # Producer pipes its result to consumer
-        producer_pid = k.spawn(
-            "PRODUCED",
-            name="producer",
-            pipe_to=consumer_pid,
-        )
-        # Tell the consumer to expect input from producer
-        k.get(consumer_pid).input_from = producer_pid
 
         assert k.wait_idle(timeout=3.0)
 
