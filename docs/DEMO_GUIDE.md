@@ -14,7 +14,7 @@ Run from one terminal at the project root with `.env` populated.
 
 ```bash
 cd C:\Users\yjm10\agentos
-python -m pytest -q tests/    #  →  130 passed, 4 skipped (Docker)
+python -m pytest -q tests/    #  →  135 passed, 4 skipped (Docker)
 ```
 
 Show the green test count. Move on.

@@ -143,5 +143,5 @@ spawn(prompt, prio, cap)
 - Kernel exposes `batcher` stats in `status()` and constructs the batching
   client by default; legacy tests still inject a fake `client_factory` and
   bypass it cleanly.
-- **130 tests passing + 4 Docker-conditional skipped.** Total LOC ~2.4k
+- **135 tests passing + 4 Docker-conditional skipped.** Total LOC ~2.4k
   application + ~1.6k tests.

@@ -91,5 +91,26 @@ See [`docs/OS_MAPPING.md`](docs/OS_MAPPING.md) for the full table. Highlights:
 - [x] **M4** — Context pager (LRU + Solar-summarize-evict + Swap) + MessageBus + Process tree + producer/consumer pipeline
 - [x] **M5** — Request batcher + REPL shell (rich) + SSE dashboard + ring trace log + final tests
 
-**130 passing tests + 4 Docker-conditional skipped.**
+**135 passing tests + 4 Docker-conditional skipped.**
 See [`docs/DEMO_GUIDE.md`](docs/DEMO_GUIDE.md) for the 7-minute grading-day demo script.
+
+---
+
+## Evaluation
+
+Four reproducible, offline metrics (no Upstage key needed) quantify the OS
+mechanisms — not the LLM. See [`docs/EVALUATION.md`](docs/EVALUATION.md) for
+methodology and a reference run.
+
+```bash
+python -m gcos.eval                         # summary table
+python -m gcos.eval --json                  # machine-readable
+python -m gcos.eval --out docs/RESULTS.md   # markdown report
+```
+
+| Metric | OS concept | Reference result |
+|---|---|---|
+| Concurrency speedup (8 agents, 4 workers) | threads + scheduling | ~2.8x vs serial |
+| Priority dispatch order | scheduling | priority-descending (PASS) |
+| Policy gate detection | syscall gate / sandbox | 88.9% caught, 0% false positives |
+| Context eviction under budget | paging | 620 → ≤200 tokens, fits |
