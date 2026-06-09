@@ -41,11 +41,26 @@ class MessageBus:
 
     # --- producer side -----------------------------------------------------
 
-    def send(self, target_pid: int, payload: dict[str, Any]) -> bool:
-        """Non-blocking send. Returns False if the mailbox is full."""
+    def send(
+        self,
+        target_pid: int,
+        payload: dict[str, Any],
+        *,
+        block: bool = False,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Deliver a message to a mailbox.
+
+        Default is non-blocking (returns False if the mailbox is full). Pass
+        `block=True` (with an optional timeout) for backpressure — the producer
+        waits for room rather than silently dropping, so a lost pipe message
+        can't strand a downstream consumer in WAITING forever (E16)."""
         mb = self._mailbox(target_pid)
         try:
-            mb.put_nowait(payload)
+            if block:
+                mb.put(payload, timeout=timeout)
+            else:
+                mb.put_nowait(payload)
             log.debug("bus.send: -> %d %s", target_pid,
                       {k: v for k, v in payload.items() if k != "content"})
             return True

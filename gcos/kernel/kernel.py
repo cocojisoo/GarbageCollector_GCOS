@@ -27,6 +27,7 @@ from typing import Callable, Optional
 from gcos.backend.batcher import BatchingSolarClient
 from gcos.backend.solar_client import SolarClient
 from gcos.ipc.message_bus import MessageBus
+from gcos.memory import ContextPager, default_policies
 from gcos.kernel.pcb import AgentControlBlock, AgentState, CapabilitySet
 from gcos.kernel.pid_alloc import PidAllocator
 from gcos.kernel.process_table import ProcessTable
@@ -51,6 +52,10 @@ class KernelConfig:
     batcher_max_concurrent: int = 4
     batcher_rate_per_s: float = 5.0
     ring_log_capacity: int = 256
+    # Context-pager budget per agent. The 3-tier memory manager (LRU → summarize
+    # → swap) only fires when an agent's context exceeds this, so a smaller
+    # budget makes paging reachable in live (not just eval) runs — see B6.
+    context_budget_tokens: int = 4096
 
     @classmethod
     def from_env(cls) -> "KernelConfig":
@@ -63,6 +68,7 @@ class KernelConfig:
             batcher_max_concurrent=int(os.getenv("GCOS_BATCHER_CONCURRENT", "4")),
             batcher_rate_per_s=float(os.getenv("GCOS_BATCHER_RATE", "5")),
             ring_log_capacity=int(os.getenv("GCOS_RING_LOG", "256")),
+            context_budget_tokens=int(os.getenv("GCOS_CONTEXT_BUDGET", "4096")),
         )
 
 
@@ -102,6 +108,18 @@ class Kernel:
         self._client_factory = client_factory
         self._live_client: Optional[object] = None
 
+        # This kernel owns its ContextPager (H22) — no process-global singleton,
+        # so two kernels in one process can't share a budget. The summarize
+        # policy is metered against this kernel's quota and, when it has to fall
+        # back to its own client, uses the throttled batcher factory (B5).
+        self.pager = ContextPager(
+            budget_tokens=self.config.context_budget_tokens,
+            policies=default_policies(
+                summarize_client_factory=self._client_factory,
+                quota=self.quota,
+            ),
+        )
+
         self.pool = WorkerPool(
             self.config.workers,
             self.queue,
@@ -127,6 +145,10 @@ class Kernel:
         if not self._started:
             return
         self.pool.shutdown()
+        # Drop every mailbox so the bus doesn't leak across kernel lifecycles
+        # (E14). Safe at shutdown: any undelivered message is moot now.
+        for pid in list(self.bus.snapshot().keys()):
+            self.bus.drop_mailbox(pid)
         self._started = False
 
     def __enter__(self) -> "Kernel":
@@ -163,6 +185,7 @@ class Kernel:
             pipe_to=pipe_to,
             input_from=input_from,
         )
+        pcb.pager = self.pager   # per-kernel memory config (H22)
         self.table.add(pcb)
         if parent_pid is not None:
             parent = self.table.get(parent_pid)
@@ -190,14 +213,47 @@ class Kernel:
         pcb = self.table.get(pid)
         if pcb is None or pcb.is_terminal():
             return False
+        # Collect descendants before reaping so we can free their mailboxes too.
+        victims = [pid] + [d.pid for d in self.tree.descendants_of(pid)]
         pcb.transition(AgentState.ZOMBIE)
         pcb.error = "killed by user"
         self.queue.pop(pcb)
         self.tree.reap_descendants(pid, reason="killed by user")
+        # Free the mailboxes of everything we just killed so they don't leak
+        # (E14). The agents are terminal — nothing will read these again.
+        for vpid in victims:
+            self.bus.drop_mailbox(vpid)
         return True
+
+    def reap_terminal(self) -> int:
+        """Remove finished agents from the process table and free their
+        mailboxes (E14). Explicit (admin/REPL) — not automatic, so the dashboard
+        keeps showing completed agents until a reap is requested. Returns the
+        number of entries reaped."""
+        reaped = 0
+        for pcb in self.table.snapshot():
+            if pcb.is_terminal():
+                self.table.remove(pcb.pid)
+                self.bus.drop_mailbox(pcb.pid)
+                reaped += 1
+        if reaped:
+            log.info("reaped %d terminal agents", reaped)
+        return reaped
 
     def wait_idle(self, timeout: float = 30.0) -> bool:
         return self.pool.wait_idle(timeout=timeout)
+
+    def swap_in(self, pid: int) -> int:
+        """Explicitly restore an agent's swapped-out context pages (B7).
+
+        Swap-out is automatic (the pager offloads on overflow); swap-in is an
+        explicit OS operation, not a page fault. Returns the number of pages
+        restored, or -1 if the PID is unknown."""
+        from gcos.memory.swap import swap_in as _swap_in
+        pcb = self.table.get(pid)
+        if pcb is None:
+            return -1
+        return _swap_in(pcb)
 
     def status(self) -> dict:
         snap = self.table.snapshot()
@@ -208,15 +264,18 @@ class Kernel:
         client = getattr(self.pool, "client", None)
         if client is not None and hasattr(client, "stats"):
             batcher_stats = client.stats
+        from gcos.sandbox import sandbox_info  # lazy: avoids docker import at boot
         return {
             "scheduler": self.scheduler.name,
             "workers": self.config.workers,
             "busy": self.pool.busy,
             "queue_len": len(self.queue),
+            "in_flight": self.queue.in_flight,
             "total_agents": len(snap),
             "by_state": by_state,
             "quota": self.quota.snapshot(),
             "batcher": batcher_stats,
             "bus_pending": self.bus.snapshot(),
+            "sandbox": sandbox_info(),
             "trace_size": len(self.trace),
         }

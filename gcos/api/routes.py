@@ -95,3 +95,10 @@ def quota_topup(amount: int, request: Request) -> dict:
     k = request.app.state.kernel
     k.quota.topup(amount)
     return k.quota.snapshot()
+
+
+@router.post("/kernel/reap")
+def kernel_reap(request: Request) -> dict:
+    """Reap finished agents (drop them from the table + free mailboxes)."""
+    k = request.app.state.kernel
+    return {"reaped": k.reap_terminal()}

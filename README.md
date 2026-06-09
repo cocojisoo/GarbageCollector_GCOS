@@ -24,6 +24,22 @@ GCOS provides each of these as a small, testable module — and uses Solar Pro 3
 not only as a workload, but also *inside the OS* (e.g. for summarize-evict in
 the memory manager).
 
+### Scope, stated honestly
+
+So reviewers know exactly what is and isn't claimed:
+
+- **Agents are single-shot.** Each agent is one prompt → one response; there is
+  no autonomous multi-step tool-use loop yet (the worker pool, quantum, and
+  re-queue machinery are multi-step-ready, but the executor isn't). GCOS today
+  is single-shot agents *composed* over IPC, not autonomous agents. (F17)
+- **The policy gate is a cheap pre-filter + audit log, not security.** It's a
+  bypassable regex source scan; the real isolation boundary is the Docker
+  sandbox. Treat its detection % as "how good is the cheap filter", not a
+  safety guarantee. (D12)
+- **Swap is a one-way offload with an explicit restore**, not demand paging. (B7)
+- **Secrets:** never commit a real key. `.env` is git-ignored; if a key was ever
+  shared (e.g. in a zip), rotate it. (H20)
+
 ---
 
 ## Quickstart
@@ -91,7 +107,7 @@ See [`docs/OS_MAPPING.md`](docs/OS_MAPPING.md) for the full table. Highlights:
 - [x] **M4** — Context pager (LRU + Solar-summarize-evict + Swap) + MessageBus + Process tree + producer/consumer pipeline
 - [x] **M5** — Request batcher + REPL shell (rich) + SSE dashboard + ring trace log + final tests
 
-**135 passing tests + 4 Docker-conditional skipped.**
+**180 passing tests + 4 Docker-conditional skipped.**
 See [`docs/DEMO_GUIDE.md`](docs/DEMO_GUIDE.md) for the 7-minute grading-day demo script.
 
 ---
@@ -110,7 +126,10 @@ python -m gcos.eval --out docs/RESULTS.md   # markdown report
 
 | Metric | OS concept | Reference result |
 |---|---|---|
-| Concurrency speedup (8 agents, 4 workers) | threads + scheduling | ~2.8x vs serial |
+| Concurrency speedup (8 agents, 4 workers) | threads + scheduling | ~3.3x vs serial (mean of 5, 95% CI ±0.05; machine-dependent) |
 | Priority dispatch order | scheduling | priority-descending (PASS) |
-| Policy gate detection | syscall gate / sandbox | 88.9% caught, 0% false positives |
+| FCFS (non-preemptive) vs RR (preemptive quantum) | scheduling | RR rotates @ quantum, halves time-to-first-slice vs FCFS convoy (PASS) |
+| Multi-worker no-double-dispatch (A1) | scheduling + sync | 40/40 agents run exactly once (PASS) |
+| Quota conservation (A3) | resource accounting | used == real calls; no leak on no-call exits (PASS) |
+| Policy gate detection (cheap pre-filter, **not** security) | syscall pre-filter | 93.1% recall, 0% false positives (2 blind spots by design) |
 | Context eviction under budget | paging | 620 → ≤200 tokens, fits |

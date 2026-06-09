@@ -18,6 +18,10 @@ touching the sandbox at all.
 This module is independent of the worker pool — the worker just calls
 `run_coder_step` instead of the plain `run_step` when the agent's capability
 says it's a coder.
+
+Scope (F17): like the plain path, the coder is **single-shot** — one LLM call,
+extract+run once, then terminal. It does not iterate (read sandbox output →
+revise code → re-run). That tool-use loop is future work; see executor.py.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import textwrap
 from typing import Optional
 
 from gcos.backend.solar_client import SolarClient
-from gcos.executor import get_default_pager
+from gcos.executor import _pager_for
 from gcos.kernel.pcb import AgentControlBlock, AgentState, ContextPage
 from gcos.sandbox import extract_python, make_runner, scan_code, scan_prompt
 from gcos.sandbox.runner import SandboxRunner
@@ -104,9 +108,10 @@ def run_coder_step(
     _ensure_coder_system_pinned(pcb)
 
     # 2. LLM call — pager assembles within token budget, applying LRU /
-    # summarize / swap as needed.
-    pager = get_default_pager()
-    messages = pager.assemble(pcb, extra_user_prompt=pcb.prompt)
+    # summarize / swap as needed. Pass the worker's batched client through so a
+    # summarize-eviction goes via the OS throttle, not a bypass client (B5).
+    pager = _pager_for(pcb)
+    messages = pager.assemble(pcb, client=client, extra_user_prompt=pcb.prompt)
     try:
         result = client.chat(
             messages,
@@ -121,6 +126,12 @@ def run_coder_step(
     pcb.quota_remaining -= 1
     pcb.llm_calls_used += 1
     pcb.tokens_used += result.tokens
+
+    # Cooperative cancellation (A4): killed mid-call → discard, don't sandbox.
+    if pcb.state == AgentState.ZOMBIE:
+        log.info("PID %d killed mid-step; discarding coder result", pcb.pid)
+        return False
+
     reply = result.content
 
     # Persist exchange for context

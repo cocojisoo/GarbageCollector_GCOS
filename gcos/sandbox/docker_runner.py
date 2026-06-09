@@ -57,12 +57,16 @@ class DockerSandboxRunner(SandboxRunner):
         pids_limit: int = 64,
         cpus: float = 1.0,
         tmpfs_size: str = "8m",
+        user: str = "65534:65534",        # nobody:nogroup — never run as root (D13)
+        max_output_bytes: int = 64 * 1024,  # cap captured stdout/stderr (D13)
     ) -> None:
         self.image = image
         self.memory = memory
         self.pids_limit = pids_limit
         self.cpus = cpus
         self.tmpfs_size = tmpfs_size
+        self.user = user
+        self.max_output_bytes = max_output_bytes
         self._client = self._connect()
 
     # --- factory bits ------------------------------------------------------
@@ -92,6 +96,16 @@ class DockerSandboxRunner(SandboxRunner):
             ) from e
 
     # --- main entry --------------------------------------------------------
+
+    def _capped(self, raw: bytes) -> str:
+        """Decode container logs, bounding how much we pull into host memory."""
+        if raw is None:
+            return ""
+        truncated = len(raw) > self.max_output_bytes
+        text = raw[: self.max_output_bytes].decode("utf-8", "replace")
+        if truncated:
+            text += f"\n...[truncated at {self.max_output_bytes} bytes]"
+        return text
 
     def run_python(self, code: str, *, timeout: float = 5.0) -> SandboxResult:
         import docker  # type: ignore  # noqa: F401  (proves availability)
@@ -128,11 +142,13 @@ class DockerSandboxRunner(SandboxRunner):
                 read_only=True,
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges"],
+                user=self.user,                 # non-root inside the container (D13)
                 mem_limit=self.memory,
                 memswap_limit=self.memory,
                 pids_limit=self.pids_limit,
                 nano_cpus=int(self.cpus * 1_000_000_000),
-                tmpfs={"/work": f"rw,size={self.tmpfs_size},exec"},
+                # mode=1777 so the non-root user can write /work/main.py.
+                tmpfs={"/work": f"rw,size={self.tmpfs_size},exec,mode=1777"},
                 working_dir="/work",
                 stdout=True,
                 stderr=True,
@@ -152,8 +168,8 @@ class DockerSandboxRunner(SandboxRunner):
                     pass
 
             try:
-                stdout = container.logs(stdout=True, stderr=False).decode("utf-8", "replace")
-                stderr = container.logs(stdout=False, stderr=True).decode("utf-8", "replace")
+                stdout = self._capped(container.logs(stdout=True, stderr=False))
+                stderr = self._capped(container.logs(stdout=False, stderr=True))
             except Exception:  # noqa: BLE001
                 pass
 

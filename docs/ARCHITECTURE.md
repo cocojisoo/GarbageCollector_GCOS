@@ -32,7 +32,8 @@
 │  Sandbox / Syscall                                           │
 │  ┌──────────────────┐ ┌─────────────────────────────────┐    │
 │  │ Policy Gate      │ │ Docker Runner                   │    │
-│  │ [SHELL]/[KERNEL] │ │ no-net / ro-fs / cap-drop / 128M│    │
+│  │ pre-filter+audit │ │ non-root / no-net / ro-fs /     │    │
+│  │ (NOT security)   │ │ cap-drop / 128M  (fail-closed)  │    │
 │  └──────────────────┘ └─────────────────────────────────┘    │
 ├──────────────────────────────────────────────────────────────┤
 │  Backend                                                     │
@@ -45,23 +46,39 @@
 
 ## Lifecycle of one agent
 
+Reflects the current dispatch path (after the A–H hardening pass below):
+
 ```
-spawn(prompt, prio, cap)
-  └── pid = pid_alloc()
-       └── pcb = AgentControlBlock(state=READY)
-            └── ready_queue.put(pcb)
-                 └── scheduler.pick_next()  ◄── worker thread
-                      └── state = RUNNING
-                           ├── quota.acquire()
-                           ├── policy_gate.check(prompt)
-                           ├── context_pager.assemble(pcb)
-                           │     └── if too big → evict (LRU or summarize)
-                           ├── batcher.submit(messages)  → solar_client.chat()
-                           ├── if code returned & cap.can_exec_code:
-                           │     └── docker_runner.run()
-                           ├── if pcb.pipe_to: message_bus.send(target, result)
-                           └── state = DONE / TIMEOUT / ERROR / ZOMBIE
-                                └── process_tree.reap_if_orphaned()
+spawn(prompt, prio, cap, [pipe_to|input_from])
+  └── pid = pid_alloc();  pcb = AgentControlBlock(state=NEW);  pcb.pager = kernel.pager
+       └── ready_queue.put(pcb)          # → READY  (refused if already terminal)
+            └── scheduler.pick_next()  ◄── worker thread
+                 │     • Priority: atomic pop_best() — select+remove under one lock (no
+                 │       double-dispatch), effective priority = base + wait-time aging
+                 │     • in-flight += 1 as part of the pop (so the system never reads
+                 │       "idle" while a dispatched agent hasn't finished)
+                 ├── if pcb already terminal (killed): drop it, task_done(), done
+                 ├── if input_from & "{INPUT}": bus.recv()
+                 │       miss → re-park WAITING; past the input deadline → ERROR (no hang)
+                 └── run up to scheduler.quantum LLM calls (RR > 1, FCFS/Pri = 1):
+                      ├── quota.acquire(1)            (exhausted → BLOCKED + park)
+                      ├── state = RUNNING
+                      ├── context_pager.assemble(pcb, client=batcher)
+                      │     └── over budget → LRU → summarize (via batcher, charges quota)
+                      │                              → swap-out to disk
+                      ├── batcher.chat(messages)     (rate-limit window + concurrency cap)
+                      ├── if the step made NO LLM call → quota.refund(1)   (no budget leak)
+                      ├── if killed mid-call (ZOMBIE) → discard result (cooperative cancel)
+                      ├── if coder & cap.can_exec_code:
+                      │     policy_gate(code) → docker_runner.run()
+                      │       (non-root, --network=none --read-only --cap-drop=ALL …)
+                      └── state = DONE / TIMEOUT / ERROR   (terminal states are absorbing)
+                 ├── if DONE & pipe_to: bus.send(target, result)   (best-effort, non-blocking)
+                 ├── if keep_going & not terminal: ready_queue.put(pcb)   # yield (RR quantum)
+                 └── task_done()   # in-flight -= 1; wakes wait_idle() once fully drained
+
+  kill(pid): state = ZOMBIE → process_tree.reap_descendants() → drop their mailboxes
+  reap_terminal() / shutdown(): free finished entries' mailboxes
 ```
 
 ## 5-Week Milestones
@@ -86,13 +103,13 @@ spawn(prompt, prio, cap)
 - **Demo**: spawn 10 agents with mixed priorities; observe ordering.
 
 ### M3 — Sandbox + Capability ✅
-- `sandbox/policy_gate.py` two-stage filter:
+- `sandbox/policy_gate.py` two-stage filter — a **cheap pre-filter + audit log, not a security boundary** (it's a bypassable regex source scan):
   - `scan_prompt()` rejects jailbreak tags (`[SHELL:]` `[KERNEL:]` `[NET:]` `[SUDO:]` `[EXFIL:]` `[EXEC:]`) **before** spending an LLM call.
-  - `scan_code()` rejects dangerous patterns in LLM-emitted code (10 rules: os.system, subprocess, eval/exec, raw sockets, HTTP libs, `/etc/*` reads, `rm -rf /`, etc.).
+  - `scan_code()` rejects dangerous patterns in LLM-emitted code (**17 rules**: os.system, subprocess, eval/exec/compile, dynamic imports, os.popen, pty, raw sockets, HTTP libs, `/etc/*` reads, absolute-path deletes, `rm -rf /`, etc. — `iter_code_rule_ids()`). Known blind spots (aliasing, reflection) are kept on purpose; Docker is the real boundary.
 - `sandbox/runner.py` defines `SandboxRunner` ABC + `SandboxResult` dataclass.
-- `sandbox/docker_runner.py` real isolation:
-  `--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=128m --memory-swap=128m --pids-limit=64 --cpus=1 --tmpfs /work:rw,exec`. `is_available()` lets the factory pick it iff Docker daemon is reachable.
-- `sandbox/subprocess_runner.py` weak-isolation **dev/CI fallback** — minimal env, temp cwd, timeout. Prints a one-time warning. Used when Docker is unavailable.
+- `sandbox/docker_runner.py` real isolation, **non-root** (`user=65534:65534`) with capped output:
+  `--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=128m --memory-swap=128m --pids-limit=64 --cpus=1 --tmpfs /work:rw,exec,mode=1777`. `is_available()` lets the factory pick it iff Docker daemon is reachable.
+- `sandbox/subprocess_runner.py` weak-isolation **dev/CI fallback** — minimal env, temp cwd, timeout. The auto-fallback prints a loud DEGRADED banner; `GCOS_SANDBOX_FAILCLOSED=1` refuses instead of degrading. `sandbox_info()` surfaces the live posture (runner/isolation/degraded) into `kernel.status()`.
 - `sandbox/extract.py` extracts the first python (or unlabeled) ```` ```python ``` ```` block from LLM replies.
 - `sandbox/__init__.py:make_runner()` is the factory: `GCOS_SANDBOX=docker|subprocess|auto`.
 - `coder.py` ties it together: a coder agent's `run_coder_step()` does
@@ -143,5 +160,27 @@ spawn(prompt, prio, cap)
 - Kernel exposes `batcher` stats in `status()` and constructs the batching
   client by default; legacy tests still inject a fake `client_factory` and
   bypass it cleanly.
-- **135 tests passing + 4 Docker-conditional skipped.** Total LOC ~2.4k
+- **188 tests passing + 4 Docker-conditional skipped.** Total LOC ~2.4k
   application + ~1.6k tests.
+
+---
+
+## Hardening pass — correctness, accounting, honesty (A–H)
+
+After M5, a review pass found that the milestone code had real concurrency bugs
+(masked because the eval only ran the scheduler on one worker) and a few claims
+that ran ahead of the implementation. This pass fixed them and made the docs
+match the code. Mapping each area onto the architecture above:
+
+| # | Area | What changed |
+|---|---|---|
+| A | Scheduler + Worker Pool | **Atomic dispatch.** `ReadyQueue.pop_best()` selects+removes under one lock (no double-dispatch on multiple workers); in-flight accounting so `is_idle()`/`wait_idle()` can't read idle mid-dispatch; per-step quota **refund** when a step makes no LLM call; **terminal states are absorbing** + cooperative cancel, so a killed agent can't be resurrected to DONE. |
+| B | Memory + Backend + Quota | Summarize-eviction now goes through the **batcher** and is **charged to the quota** (the OS owns *its own* Solar calls too). The pager is **per-kernel** (no process-global singleton) with a configurable budget. Swap is honestly a one-way offload + explicit `Kernel.swap_in`. |
+| C | Scheduler | Preemption made textbook-correct: **FCFS is non-preemptive** (runs an agent to completion → convoy effect) while **RoundRobin preempts on a real quantum** of LLM calls — they share FIFO selection but differ in preemption, so RR is genuinely distinct, not an FCFS stub (single-shot agents make them coincide, which is the correct RR-degenerates-to-FCFS case). **Priority has wait-time aging** so nothing starves and is preemptive (re-picks each call). O(n) selection is a documented trade-off. Quantified by the `scheduler_preemption` eval. |
+| D | Sandbox | Docker-absent fallback is **loud / fail-closeable**; container runs **non-root** with capped output; the gate is reframed as a **pre-filter/audit log, not security** (more rules, but documented blind spots). `kernel.status()` exposes the live posture. |
+| E | Process Tree + IPC | **Reaping** — `kill`/`reap_terminal`/`shutdown` free mailboxes; ZOMBIE entries no longer leak. A WAITING consumer is **bounded by an input deadline** (no forever-hang on a lost pipe message). State machine has a legal-transition table. |
+| F | Executor | Documented honestly: **agents are single-shot** (one prompt → one response); the worker/quantum/re-queue machinery is multi-step-ready, but the tool-use loop is future work. |
+| G | Eval | Added metrics that actually exercise the bugs above (multi-worker no-double-dispatch, quota conservation, repeated speedup mean±CI) and an enlarged, honestly-blind-spotted gate corpus. |
+
+See `docs/EVALUATION.md` for the reference numbers and `docs/OS_MAPPING.md` for the
+concept-by-concept table (both updated in this pass).

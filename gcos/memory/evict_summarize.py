@@ -38,10 +38,16 @@ class SummarizeEvictionPolicy(EvictionPolicy):
         *,
         client_factory: Optional[Callable[[], object]] = None,
         max_summary_tokens: int = 200,
+        quota: Optional[object] = None,
     ) -> None:
         self.batch_size = batch_size
         self.client_factory = client_factory
         self.max_summary_tokens = max_summary_tokens
+        # Optional shared OS quota. The summarize call is a *real* Solar request
+        # the OS issues on the agent's behalf, so it must be accounted for just
+        # like any other call (B5). When the budget can't cover it we skip
+        # (return 0) and let the next policy — swap — do the eviction instead.
+        self.quota = quota
 
     def evict(self, pcb: AgentControlBlock, *, client: Optional[object] = None) -> int:
         candidates = [
@@ -54,6 +60,14 @@ class SummarizeEvictionPolicy(EvictionPolicy):
         candidates.sort(key=lambda p: p.last_access)
         batch = candidates[: self.batch_size]
 
+        # Account for the summarize call against the OS budget before spending.
+        if self.quota is not None and not self.quota.acquire(1):
+            log.info("summarize: PID %d skipped — global quota exhausted", pcb.pid)
+            return 0
+
+        # Prefer the client the worker is already holding (the rate-limited /
+        # concurrency-capped batcher) so summarize calls go through the OS's
+        # Solar throttle and show up in its stats — not a raw bypass client (B5).
         c = client or (self.client_factory() if self.client_factory else None)
         if c is None:
             from gcos.backend.solar_client import SolarClient  # lazy
@@ -63,14 +77,21 @@ class SummarizeEvictionPolicy(EvictionPolicy):
         log.info("summarize: PID %d compressing %d pages (~%d tokens)",
                  pcb.pid, len(batch), sum(p.tokens for p in batch))
 
-        result = c.chat(
-            [
-                {"role": "system", "content": SUMMARIZE_SYSTEM},
-                {"role": "user", "content": body},
-            ],
-            max_tokens=self.max_summary_tokens,
-            timeout=20.0,
-        )
+        try:
+            result = c.chat(
+                [
+                    {"role": "system", "content": SUMMARIZE_SYSTEM},
+                    {"role": "user", "content": body},
+                ],
+                max_tokens=self.max_summary_tokens,
+                timeout=20.0,
+            )
+        except Exception:
+            # Call never landed — hand the reserved unit back so a failed
+            # summarize doesn't permanently shrink the OS budget.
+            if self.quota is not None:
+                self.quota.refund(1)
+            raise
         summary_text = result.content.strip()
         summary_tokens = (
             result.completion_tokens

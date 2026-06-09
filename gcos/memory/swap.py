@@ -4,8 +4,13 @@ This is the closest thing GCOS has to OS swap: when context overflows and
 LRU has hit its min_keep floor, we serialize a batch of pages to a JSON
 file under `logs/swap/<pid>/` and remove them from the in-memory PCB.
 
-Reloading is currently manual (debug only) via `swap_in(pcb, swap_dir)` —
-M5 may add an automatic prefetcher.
+**Honesty note (B7): this is a *one-way offload* with an *explicit* restore,
+not demand paging.** Swap-out happens automatically inside the pager when
+context overflows; swap-in does NOT happen on a page fault, because GCOS has no
+"access an evicted turn" operation to fault on. The round trip is real and
+lossless (see `swap_in`, exercised by tests/test_swap.py) but must be requested
+explicitly — e.g. `Kernel.swap_in(pid)` / the REPL. Automatic prefetch on a
+context miss is deliberately left as future work rather than faked.
 """
 
 from __future__ import annotations
@@ -81,7 +86,11 @@ class SwapEvictionPolicy(EvictionPolicy):
 
 def swap_in(pcb: AgentControlBlock,
             swap_dir: pathlib.Path | str = DEFAULT_SWAP_DIR) -> int:
-    """Load all swapped pages for a PID back into context_pages (debug helper)."""
+    """Restore all swapped pages for a PID back into context_pages.
+
+    The explicit other half of the swap round trip (see module docstring). Used
+    by `Kernel.swap_in` / the REPL; lossless (round trip covered by
+    tests/test_swap.py)."""
     target_dir = pathlib.Path(swap_dir) / str(pcb.pid)
     if not target_dir.is_dir():
         return 0

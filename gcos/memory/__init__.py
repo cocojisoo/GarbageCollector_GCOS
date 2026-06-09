@@ -16,11 +16,18 @@ from gcos.memory.swap import SwapEvictionPolicy, swap_in
 from gcos.memory.tokens import estimate_tokens
 
 
-def default_policies(*, summarize_client_factory=None) -> list[EvictionPolicy]:
-    """The standard 3-tier policy stack used by Kernel."""
+def default_policies(*, summarize_client_factory=None, quota=None) -> list[EvictionPolicy]:
+    """The standard 3-tier policy stack used by Kernel.
+
+    `quota` (the shared OS budget) is threaded into the summarize policy so its
+    Solar call is accounted for; if omitted, summarize runs unmetered (the
+    offline eval path).
+    """
     return [
         LRUEvictionPolicy(min_keep=2),
-        SummarizeEvictionPolicy(batch_size=4, client_factory=summarize_client_factory),
+        SummarizeEvictionPolicy(
+            batch_size=4, client_factory=summarize_client_factory, quota=quota,
+        ),
         SwapEvictionPolicy(batch_size=2, min_keep=2),
     ]
 

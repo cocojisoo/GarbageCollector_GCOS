@@ -1,4 +1,4 @@
-"""Policy gate — the *first* line of defense before the sandbox.
+"""Policy gate — a cheap first-pass filter and audit log, NOT a security boundary.
 
 Two scans:
 
@@ -12,12 +12,22 @@ Two scans:
    The gate denies before we even pay for an LLM call.
 
 2. `scan_code(code)` — looks for dangerous imports/calls in LLM-generated
-   code: `os.system`, `subprocess`, sockets, eval/exec, filesystem writes
-   outside the sandbox work dir.
+   code: `os.system`, `subprocess`, sockets, eval/exec/compile, dynamic
+   imports, filesystem deletes, etc.
 
-This is *defense in depth*: the Docker sandbox enforces real isolation. The
-policy gate just catches the obvious stuff cheaply and produces auditable
-logs (which the ring trace log in M5 will surface to the dashboard).
+WHAT THIS IS (and isn't), D12 — read before quoting any detection number:
+  - It is a **regex scan of source text**. That makes it trivially bypassable:
+    aliasing (`f = os.system`), `getattr`/`vars()` indirection, string-built
+    names, base64/hex encoding, or any construct that doesn't match a literal
+    pattern sails straight through. We add a few more patterns below, but the
+    set is and always will be incomplete.
+  - Its real value is **(a) blocking the obvious stuff before spending an LLM
+    call, and (b) producing an auditable DENY log** (surfaced to the dashboard
+    via the ring trace log) — not security.
+  - **The actual isolation boundary is the Docker sandbox** (`--network=none
+    --read-only --cap-drop=ALL --pids-limit --memory`, non-root). Treat the
+    gate's detection % as "how good is the cheap pre-filter", never as a safety
+    guarantee. See docs/EVALUATION.md.
 """
 
 from __future__ import annotations
@@ -91,6 +101,25 @@ _CODE_RULES: tuple[tuple[re.Pattern, str, str], ...] = (
         "code.rm_rf_root", "`rm -rf /` pattern in source"),
     (re.compile(r"\b(shutil\.rmtree)\s*\(\s*['\"]/"),
         "code.shutil_rmtree_root", "shutil.rmtree on an absolute root path"),
+    # --- added patterns (D12): catch a few cheap evasions. Appended after the
+    # rules above so existing rule-IDs still fire first for their cases. This
+    # set is still NOT exhaustive — the gate is a pre-filter, not a boundary.
+    (re.compile(r"\bos\.popen\s*\("),
+        "code.os_popen", "os.popen() runs a shell command"),
+    (re.compile(r"\b__import__\s*\("),
+        "code.import_dynamic", "dynamic __import__() of any module bypasses static checks"),
+    # Builtin compile( only — the negative lookbehind avoids false-matching the
+    # ubiquitous `re.compile(...)` / `model.compile(...)` method calls.
+    (re.compile(r"(?<![.\w])compile\s*\("),
+        "code.compile", "compile() builds code objects for exec/eval"),
+    (re.compile(r"\bpty\.(spawn|fork|openpty)\s*\("),
+        "code.pty", "pty.* can spawn an interactive shell"),
+    (re.compile(r"\b__builtins__\b"),
+        "code.builtins_access", "touching __builtins__ is a sandbox-escape pattern"),
+    (re.compile(r"\bglobals\s*\(\s*\)\s*\["),
+        "code.globals_index", "indexing globals() is used to reach hidden builtins"),
+    (re.compile(r"\bos\.(remove|unlink|rmdir)\s*\(\s*['\"]/"),
+        "code.fs_delete_abs", "deleting an absolute path (e.g. /etc/*) is forbidden"),
 )
 
 

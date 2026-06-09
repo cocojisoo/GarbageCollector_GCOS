@@ -10,8 +10,16 @@ Two entry points:
 - `run_agent(pcb, client)` — convenience wrapper: loops `run_step` until
   the agent terminates. Used by the M1 CLI and tests.
 
-For M2 the only completion condition is "first successful LLM call → DONE".
-M4 will add tool-use loops where `run_step` may return True multiple times.
+Agent model — honest scope (F17): **agents are currently single-shot.** A plain
+or coder step makes exactly one LLM call and goes terminal ("one successful
+call → DONE"); `run_step` never returns True today. The *infrastructure* around
+it is already multi-step capable — the worker runs up to a scheduler quantum of
+calls per dispatch and re-queues unfinished agents (see worker_pool / RR) — so
+adding a real multi-step tool-use loop is a change to this module, not the
+kernel. That loop (assistant emits a tool call → execute → feed back → repeat)
+is deliberately future work, not claimed as done. So GCOS today is best
+described as "one prompt → one response" agents wired together over IPC, not
+autonomous multi-step agents.
 """
 
 from __future__ import annotations
@@ -47,11 +55,24 @@ def set_default_pager(pager: ContextPager) -> None:
     _DEFAULT_PAGER = pager
 
 
-def _build_messages(pcb: AgentControlBlock, pager: ContextPager) -> list[dict]:
+def _pager_for(pcb: AgentControlBlock) -> ContextPager:
+    """Use the kernel's pager when one is wired onto the PCB (H22), else the
+    module default. This keeps two kernels in one process from sharing a budget."""
+    pager = getattr(pcb, "pager", None)
+    return pager if isinstance(pager, ContextPager) else get_default_pager()
+
+
+def _build_messages(
+    pcb: AgentControlBlock, pager: ContextPager, client: Optional[SolarClient] = None,
+) -> list[dict]:
     """Assemble messages within the token budget. Appends the current user
-    turn only on the *first* step (subsequent steps just consume context)."""
+    turn only on the *first* step (subsequent steps just consume context).
+
+    `client` is the worker's (batched) Solar client; passing it through lets a
+    summarize-eviction reuse the OS's throttle instead of a bypass client (B5).
+    """
     extra = pcb.prompt if pcb.llm_calls_used == 0 else None
-    return pager.assemble(pcb, extra_user_prompt=extra)
+    return pager.assemble(pcb, client=client, extra_user_prompt=extra)
 
 
 def run_step(pcb: AgentControlBlock, client: Optional[SolarClient] = None) -> bool:
@@ -85,7 +106,7 @@ def _run_plain_step(pcb: AgentControlBlock, client: Optional[SolarClient] = None
 
     try:
         result = client.chat(
-            _build_messages(pcb, get_default_pager()),
+            _build_messages(pcb, _pager_for(pcb), client=client),
             max_tokens=min(pcb.capability.max_tokens, 1024),
             timeout=pcb.timeout_s,
         )
@@ -101,6 +122,15 @@ def _run_plain_step(pcb: AgentControlBlock, client: Optional[SolarClient] = None
     pcb.quota_remaining -= 1
     pcb.llm_calls_used += 1
     pcb.tokens_used += result.tokens
+
+    # Cooperative cancellation (A4): the LLM call is non-preemptible, but if the
+    # agent was killed while we were inside it, discard the result rather than
+    # overwriting ZOMBIE with DONE. (transition() would also reject DONE now,
+    # but this avoids recording a dead agent's output and piping it downstream.)
+    if pcb.state == AgentState.ZOMBIE:
+        log.info("PID %d killed mid-step; discarding result", pcb.pid)
+        return False
+
     pcb.result = result.content
 
     # Persist exchange — first step also records the original prompt

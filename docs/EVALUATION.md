@@ -28,10 +28,19 @@ how-much question about it.
 
 | # | Metric | OS concept exercised | Question answered |
 |---|--------|----------------------|-------------------|
-| 1 | Concurrency speedup | threads, synchronization, scheduling | Does the worker pool actually parallelize agents? |
+| 1 | Concurrency speedup (single + repeated mean±CI) | threads, synchronization, scheduling | Does the worker pool actually parallelize agents, and is the speedup stable across runs? |
 | 2 | Scheduler ordering | scheduling (priority) | Are higher-priority agents dispatched first? |
-| 3 | Policy gate detection | syscall gate / sandbox | What fraction of dangerous calls does the first-line filter catch, and does it over-block? |
+| 2b | FCFS vs RR preemption | scheduling (preemption) | Does FCFS run to completion (convoy) while RR rotates on a quantum — i.e. is RR actually distinct from FCFS? **(C8)** |
+| 2c | Multi-worker no-double-dispatch | scheduling, synchronization | With W>1 workers, is each agent dispatched *exactly once* (no Priority race)? **(A1)** |
+| 2d | Quota conservation | resource accounting | Does the shared OS budget charge only real LLM calls, refunding no-call exits? **(A3)** |
+| 3 | Policy gate detection | syscall pre-filter (NOT security) | What fraction of obvious dangerous calls does the cheap filter catch, and does it over-block? |
 | 4 | Eviction efficacy | virtual memory / paging | Does the context pager bring an over-budget context back under budget? |
+
+> Metrics 2b–2d were added because the original harness ran the scheduler on a
+> *single* worker with single-shot fakes — so it never exercised RR's quantum vs
+> FCFS (C8), the multi-worker Priority dispatch race (A1), or the quota-refund
+> path (A3). They drive a real worker pool and assert the behaviour/invariants
+> those gaps hid.
 
 ---
 
@@ -43,20 +52,76 @@ once with 1 worker and once with W workers. The step runner is a fake that
 releases the GIL, concurrent workers genuinely overlap. We report wall-clock
 for each and the ratio.
 
-**Config.** N = 8 agents, per_call_s = 0.05 s, W = 4 workers.
+**Config.** N = 8 agents, per_call_s = 0.05 s, W = 4 workers. The repeated
+variant runs the measurement 5× (per_call_s = 0.02 s) and reports mean ± stddev
+and a 95% CI half-width, because a single timing number is noisy.
 
-**Reference result.**
+**Reference result (machine-dependent — yours will differ).**
 
 | | Wall-clock |
 |---|---|
-| Serial (1 worker) | ~0.45 s |
-| Parallel (4 workers) | ~0.15 s |
-| **Speedup** | **~2.8x** (2.7-3.0x across runs; ideal 4x, ~70% efficiency) |
+| Serial (1 worker) | ~0.44 s |
+| Parallel (4 workers) | ~0.12 s |
+| **Speedup (single run)** | **~3.6x** |
+| **Speedup (mean of 5)** | **~3.3x ± 0.06** (95% CI ±0.05, range 3.2-3.4x; ideal 4x) |
 
 The gap from the ideal 4x is thread-scheduling and queue-contention overhead,
-which is the expected, honest result for a thread-pool model. Speedup scaling
-with W is the evidence that the pool + ready-queue + scheduler are doing real
-concurrent dispatch.
+which is the expected, honest result for a thread-pool model. Reporting the mean
+± CI over repeats (not one lucky run) is what backs the claim. The exact number
+is machine-dependent; the test asserts only that parallel beats serial by a
+comfortable margin.
+
+---
+
+## 2b. FCFS (non-preemptive) vs RR (preemptive quantum) — C8
+
+**Method.** Drive the **real worker pool** (1 worker) with 3 multi-step agents
+(4 LLM calls each) once under FCFS and once under RR(quantum=2). Record the
+dispatch order; report the longest consecutive run per agent and the mean
+"time-to-first-slice" (how soon each agent first runs).
+
+This is the metric that answers "is RR actually different from FCFS, or just a
+`popleft` stub?" FCFS is **non-preemptive** (quantum=None) so it runs each agent
+to completion; RR **preempts** every quantum so the agents interleave. (For
+single-shot agents they coincide — RR with quantum ≥ burst == FCFS — so the
+difference only shows up with multi-step jobs.)
+
+**Reference result.**
+
+| | Dispatch order | Longest run | Mean time-to-first-slice |
+|---|---|---|---|
+| FCFS | `[1,1,1,1, 2,2,2,2, 3,3,3,3]` | 4 (run to completion → convoy) | 4.0 |
+| RR(2) | `[1,1, 2,2, 3,3, 1,1, 2,2, 3,3]` | 2 (rotates at quantum) | 2.0 |
+
+RR halves the mean wait for a first slice (4.0 → 2.0) and caps any agent's
+monopoly at the quantum — the textbook RR-fixes-FCFS-convoy result. **PASS**.
+
+## 2c. Multi-worker priority — no double-dispatch (A1)
+
+**Method.** Drain 40 agents through **8** workers + `PriorityScheduler`, with a
+fake runner that counts executions per PID under a lock. Assert every agent ran
+**exactly once**. This is an **invariant check on the current atomic dispatch**
+(`pop_best()` selects + removes under one lock).
+
+**Honesty note.** This metric does *not* fail on the old `snapshot()`+`max()`+
+`pop()` code: under CPython's GIL the select→remove window almost never opens, so
+the racy version passes it too. It guards the new contract, not the old bug. The
+*deterministic* reproduction — which injects a select→remove window and shows the
+old pattern double-dispatching while `pop_best` does not — lives in
+`tests/test_concurrency_correctness.py::test_old_nonatomic_selection_can_double_dispatch_but_pop_best_cannot`.
+
+**Reference result.** 40/40 agents dispatched, max runs/agent = **1** → **PASS**.
+
+## 2d. Quota conservation (A3)
+
+**Method.** Run 8 agents that make a real call and 8 that exit *without* one
+(simulating a gate DENY / per-agent-quota-0 / timeout). Assert the shared OS
+quota's `used` equals the number of **real** calls (8), not the number of steps
+(16).
+
+**Reference result.** Global quota used = **8** == real calls → conserved
+**True**. (Before the fix it would read 16: the worker spent a unit per step and
+never refunded the no-call exits.)
 
 ---
 
@@ -75,29 +140,38 @@ single-step agents — documented in `docs/OS_MAPPING.md`).
 
 ---
 
-## 3. Policy gate detection
+## 3. Policy gate detection — a cheap pre-filter, **NOT** security
+
+**Read this before quoting the number.** The gate is a **bypassable regex scan
+of source text**. Its value is (a) blocking the obvious stuff before paying for
+an LLM call and (b) producing an auditable DENY log — *not* security. The real
+isolation boundary is the Docker sandbox. So treat the percentage below as "how
+good is the cheap filter", never as a safety guarantee. (See `docs/OS_MAPPING.md`
+item 16/17 and the D12 reframing.)
 
 **Method.** Run a labelled corpus through `policy_gate.scan_prompt` /
 `scan_code`: positives are prompts/code the gate should deny (jailbreak tags,
-`os.system`, `subprocess`, `eval`/`exec`, `/etc` reads, raw sockets, HTTP
-libraries, `rm -rf /`, `shutil.rmtree("/")`), negatives are realistic benign
-prompts/code. We compute detection rate (recall), false-positive rate, and
-precision. The corpus **deliberately includes two evasions the regex gate does
-not catch** (`os.popen`, `os.remove('/etc/...')`) so the number reflects reality.
+`os.system`, `subprocess`, `eval`/`exec`/`compile`, dynamic imports, `os.popen`,
+`pty`, `/etc` reads, absolute-path deletes, sockets, HTTP libraries, `rm -rf /`,
+`shutil.rmtree("/")`), negatives are realistic benign prompts/code. The corpus
+**deliberately keeps known blind spots** — aliasing (`f = os.system; f('id')`)
+and reflection (`getattr(os, 'sys'+'tem')`) — so the number reflects reality.
 
 **Reference result.**
 
 | Metric | Value |
 |---|---|
-| Attacks caught | 16 / 18 (**88.9%** detection) |
-| False positives on benign input | 0 / 10 (**0.0% FPR**) |
+| Attacks caught | 27 / 29 (**93.1%** recall) |
+| False positives on benign input | 0 / 20 (**0.0% FPR**) |
 | Precision | **100%** |
-| Known misses | `os.popen(...)`, `os.remove('/etc/...')` |
+| Known blind spots (by design) | `f = os.system; f('id')`, `getattr(os, 'sys'+'tem')('id')` |
 
-The story is exactly the defense-in-depth design: the gate is a **cheap first
-filter** with zero false alarms on benign code, and the ~11% it misses is what
-the Docker sandbox (`--network=none --read-only --cap-drop=ALL`) exists to
-contain. The gate is not claimed to be complete on its own.
+The two misses are exactly the point: a regex can't see intent through aliasing
+or reflection, and no amount of added patterns closes that class — which is why
+the gate is the *first* line and Docker (`--network=none --read-only
+--cap-drop=ALL`, non-root) is the boundary. The corpus is still small and
+hand-built; it demonstrates the filter's behaviour and blind spots, not an
+exhaustive audit.
 
 ---
 

@@ -13,9 +13,11 @@ Run from one terminal at the project root with `.env` populated.
 ## 0 — Preflight (10 s)
 
 ```bash
-cd C:\Users\yjm10\agentos
-python -m pytest -q tests/    #  →  135 passed, 4 skipped (Docker)
+cd <repo root>                # e.g. ~/GarbageCollector_GCOS
+python -m pytest -q tests/    #  →  188 passed, 4 skipped (Docker)
 ```
+
+> macOS/Docker-via-colima walkthrough: see `DEMO_RUN.md` at the repo root.
 
 Show the green test count. Move on.
 
@@ -91,9 +93,14 @@ python -m gcos coder "Write minimal Python that uses eval() to compute 2+3."
 #   → tokens=~100, sandbox BLOCKED, rule=code.eval
 ```
 
-Point at `gcos/sandbox/policy_gate.py` rules list (10 code rules + 6 prompt
-tag patterns). Mention that if both gates were bypassed, Docker is the third
-line of defense (`--network=none --read-only --cap-drop=ALL --memory=128m`).
+Point at `gcos/sandbox/policy_gate.py` rules list (17 code rules + 6 prompt
+tag patterns). Be explicit that the gate is a **cheap pre-filter + audit log,
+not a security boundary** — it's a bypassable regex scan with deliberate blind
+spots (aliasing, reflection). The real isolation is Docker, the third line:
+**non-root** `--network=none --read-only --cap-drop=ALL --memory=128m`. If Docker
+is missing, the auto-fallback prints a loud DEGRADED banner (or set
+`GCOS_SANDBOX_FAILCLOSED=1` to refuse); `kernel.status().sandbox` shows the live
+posture on the dashboard.
 
 ---
 
@@ -171,11 +178,14 @@ state loss.
 | If asked… | Point at |
 |---|---|
 | "Is this a real kernel?" | No — userspace mini-OS. The novelty is the *concept mapping*, not ring-0 code. |
-| "Why Solar for evict?" | Because we have it. The OS *managing the LLM with the LLM* is the project's signature. |
-| "Why does RR look like FCFS sometimes?" | M2 agents are single-step. RR really kicks in for M4 tool-use loops (multi-step). Quantum = 1 LLM call. |
-| "Is the subprocess sandbox safe?" | **No** — it's dev/CI fallback that explicitly says so. Demo uses Docker. |
+| "Why Solar for evict?" | Because we have it. The OS *managing the LLM with the LLM* is the project's signature — and that summarize call goes through the OS's own batcher + quota, not around them. |
+| "Are the agents autonomous multi-step?" | Honestly, **no — single-shot today** (one prompt → one response). The worker pool, RR quantum, and re-queue path are multi-step-ready; the tool-use loop is future work. We don't oversell it. |
+| "Why does RR look like FCFS sometimes?" | They differ in **preemption**, not selection (both pick FIFO). **FCFS is non-preemptive** (runs each agent to completion → convoy effect); **RR preempts** every quantum of LLM calls. With single-shot agents every job is one call, so RR (quantum ≥ burst) *degenerates* to FCFS — standard, not a stub. With multi-step agents they diverge: see the `scheduler_preemption` eval (FCFS `[1,1,1,1,2,2,2,2,3,3,3,3]` vs RR `[1,1,2,2,3,3,…]`, mean time-to-first-slice 4.0 → 2.0). |
+| "Doesn't high priority starve low priority?" | No — `PriorityScheduler` adds **wait-time aging**, so a long-waiting agent's effective priority rises and it eventually runs. |
+| "Is the 88/93% gate number a security metric?" | **No.** The gate is a cheap pre-filter + audit log; that % is filter recall, with documented blind spots. Security is the Docker sandbox. |
+| "Is the subprocess sandbox safe?" | **No** — dev/CI fallback that says so loudly (DEGRADED banner; fail-closed available). Demo uses Docker, non-root. |
 | "How does this scale?" | The batcher's concurrency semaphore + token bucket let one operator dial throughput per Upstage plan. |
-| "Why a ring log instead of files?" | Same reason Linux has both: ring for fast diagnostic, files for persistence. M5 ring is in-memory only (256 entries default). |
+| "Why a ring log instead of files?" | Same reason Linux has both: ring for fast diagnostic, files for persistence. The ring is in-memory only (256 entries default). |
 
 ---
 
