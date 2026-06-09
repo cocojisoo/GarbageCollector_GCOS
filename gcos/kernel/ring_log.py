@@ -21,6 +21,7 @@ the snapshot directly.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -34,6 +35,17 @@ class RingTraceLog(logging.Handler):
         self._buf: deque[dict] = deque(maxlen=capacity)
         self._lock = threading.Lock()
         self._attached_to: Optional[logging.Logger] = None
+        # Fork-safety (for the process executor, which forks worker threads):
+        # CPython resets the stdlib logging locks + each Handler.lock in the
+        # child via os.register_at_fork, but NOT this private _lock. If a sibling
+        # thread held _lock at the fork instant, the child would deadlock on the
+        # first log call (the next `with self._lock`). Reset it in the child so a
+        # forked agent can always log. See gcos/kernel/process_pool.py.
+        if hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=self._reinit_lock_after_fork)
+
+    def _reinit_lock_after_fork(self) -> None:
+        self._lock = threading.Lock()
 
     # --- direct API --------------------------------------------------------
 

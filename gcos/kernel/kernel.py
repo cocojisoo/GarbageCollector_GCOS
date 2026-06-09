@@ -57,8 +57,21 @@ class KernelConfig:
     # budget makes paging reachable in live (not just eval) runs — see B6.
     context_budget_tokens: int = 4096
 
+    # Daemon cgroup limits (Linux only; the OS's own resource budget enforced by
+    # the kernel). pids_max is safe-by-default (anti fork-bomb); memory/cpu are
+    # off by default so a misconfig can never OOM-kill the OS. Opt in via env.
+    cgroup_pids_max: Optional[int] = 512
+    cgroup_memory_max: Optional[int] = None
+    cgroup_cpu_max: Optional[str] = None
+    # Execution backend: "thread" (default — agents on worker threads) or
+    # "process" (each agent is a real OS process under a per-agent cgroup whose
+    # cpu.weight = priority, giving true per-agent CFS in the live path on Linux).
+    executor_backend: str = "thread"
+
     @classmethod
     def from_env(cls) -> "KernelConfig":
+        def _opt_int(v: Optional[str], default: Optional[int]) -> Optional[int]:
+            return int(v) if v not in (None, "") else default
         return cls(
             scheduler=os.getenv("GCOS_SCHEDULER", "fcfs"),
             workers=int(os.getenv("GCOS_WORKERS", "4")),
@@ -69,6 +82,10 @@ class KernelConfig:
             batcher_rate_per_s=float(os.getenv("GCOS_BATCHER_RATE", "5")),
             ring_log_capacity=int(os.getenv("GCOS_RING_LOG", "256")),
             context_budget_tokens=int(os.getenv("GCOS_CONTEXT_BUDGET", "4096")),
+            cgroup_pids_max=_opt_int(os.getenv("GCOS_CGROUP_PIDS_MAX"), 512),
+            cgroup_memory_max=_opt_int(os.getenv("GCOS_CGROUP_MEMORY_MAX"), None),
+            cgroup_cpu_max=os.getenv("GCOS_CGROUP_CPU_MAX") or None,
+            executor_backend=os.getenv("GCOS_EXEC", "thread"),
         )
 
 
@@ -107,6 +124,7 @@ class Kernel:
         # Remember the factory so the API can introspect the live client.
         self._client_factory = client_factory
         self._live_client: Optional[object] = None
+        self._daemon_cgroup: Optional[object] = None  # set at start() on Linux
 
         # This kernel owns its ContextPager (H22) — no process-global singleton,
         # so two kernels in one process can't share a budget. The summarize
@@ -120,7 +138,12 @@ class Kernel:
             ),
         )
 
-        self.pool = WorkerPool(
+        if self.config.executor_backend == "process":
+            from gcos.kernel.process_pool import ProcessWorkerPool
+            pool_cls = ProcessWorkerPool
+        else:
+            pool_cls = WorkerPool
+        self.pool = pool_cls(
             self.config.workers,
             self.queue,
             self.scheduler,
@@ -136,6 +159,25 @@ class Kernel:
     def start(self) -> None:
         if self._started:
             return
+        # Surface the OS-enforcement posture loudly, like the sandbox does: if the
+        # host can't enforce cgroup CFS / signals (non-Linux), say so rather than
+        # quietly running the in-process simulation (osprims degrade banner).
+        from gcos.osprims import warn_if_degraded
+        warn_if_degraded()
+        # Place the whole GCOS daemon in a cgroup so its resource budget (pids,
+        # and optionally memory/cpu) is enforced by the kernel, not a Python
+        # counter. Best-effort: no-op off Linux / without cgroup delegation.
+        from gcos.osprims import cgroup as _cg
+        self._daemon_cgroup = _cg.place_daemon(
+            pids_max=self.config.cgroup_pids_max,
+            memory_max=self.config.cgroup_memory_max,
+            cpu_max=self.config.cgroup_cpu_max,
+        )
+        if self._daemon_cgroup is not None:
+            log.info("kernel: OS budget kernel-enforced via %s "
+                     "(pids_max=%s memory_max=%s cpu_max=%s)",
+                     self._daemon_cgroup.path, self.config.cgroup_pids_max,
+                     self.config.cgroup_memory_max, self.config.cgroup_cpu_max)
         self.pool.start()
         self._started = True
         log.info("Kernel started: scheduler=%s workers=%d quota_total=%d",
@@ -145,6 +187,11 @@ class Kernel:
         if not self._started:
             return
         self.pool.shutdown()
+        # Best-effort: drop the daemon cgroup (rmdir defers while the process is
+        # still in it, which is fine — it's reclaimed on exit / next boot).
+        if self._daemon_cgroup is not None:
+            self._daemon_cgroup.remove()
+            self._daemon_cgroup = None
         # Drop every mailbox so the bus doesn't leak across kernel lifecycles
         # (E14). Safe at shutdown: any undelivered message is moot now.
         for pid in list(self.bus.snapshot().keys()):
@@ -217,6 +264,11 @@ class Kernel:
         victims = [pid] + [d.pid for d in self.tree.descendants_of(pid)]
         pcb.transition(AgentState.ZOMBIE)
         pcb.error = "killed by user"
+        # If this agent is running as a real process (process backend), SIGKILL
+        # it for real — kill becomes a genuine kernel signal, not just a flag.
+        if hasattr(self.pool, "kill_running"):
+            for vpid in victims:
+                self.pool.kill_running(vpid)
         self.queue.pop(pcb)
         self.tree.reap_descendants(pid, reason="killed by user")
         # Free the mailboxes of everything we just killed so they don't leak
@@ -265,6 +317,15 @@ class Kernel:
         if client is not None and hasattr(client, "stats"):
             batcher_stats = client.stats
         from gcos.sandbox import sandbox_info  # lazy: avoids docker import at boot
+        from gcos.osprims import caps_info     # real-OS enforcement posture
+        daemon_cg = None
+        if self._daemon_cgroup is not None:
+            daemon_cg = {
+                "path": self._daemon_cgroup.path,
+                "memory_current": self._daemon_cgroup.memory_current(),
+                "cpu_usage_us": self._daemon_cgroup.cpu_usage_us(),
+                "pids_max": self.config.cgroup_pids_max,
+            }
         return {
             "scheduler": self.scheduler.name,
             "workers": self.config.workers,
@@ -277,5 +338,7 @@ class Kernel:
             "batcher": batcher_stats,
             "bus_pending": self.bus.snapshot(),
             "sandbox": sandbox_info(),
+            "osprims": caps_info(),
+            "daemon_cgroup": daemon_cg,
             "trace_size": len(self.trace),
         }

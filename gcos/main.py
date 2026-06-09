@@ -42,6 +42,10 @@ def _setup_logging(level: str) -> None:
 
 def cmd_spawn(args: argparse.Namespace) -> int:
     """Spawn one agent, run it, print the result."""
+    capability = (
+        CapabilitySet.agent(max_tool_calls=args.max_steps)
+        if args.multi_step else CapabilitySet.default_user()
+    )
     pcb = AgentControlBlock(
         pid=next_pid(),
         name=args.name,
@@ -49,12 +53,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         priority=args.priority,
         timeout_s=args.timeout,
         quota_remaining=args.quota,
-        capability=CapabilitySet.default_user(),
+        capability=capability,
     )
-    print(f"[gcos] spawned pid={pcb.pid} name={pcb.name} prio={pcb.priority}")
+    kind = "multi-step ReAct" if args.multi_step else "single-shot"
+    print(f"[gcos] spawned pid={pcb.pid} name={pcb.name} prio={pcb.priority} ({kind})")
     run_agent(pcb)
     print(f"[gcos] pid={pcb.pid} state={pcb.state.value} "
-          f"tokens={pcb.tokens_used} wall={pcb.wall_time():.2f}s")
+          f"calls={pcb.llm_calls_used} tokens={pcb.tokens_used} wall={pcb.wall_time():.2f}s")
     if pcb.error:
         print(f"[gcos] error: {pcb.error}", file=sys.stderr)
         return 1
@@ -203,6 +208,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--priority", type=int, default=5)
     sp.add_argument("--timeout", type=float, default=30.0)
     sp.add_argument("--quota", type=int, default=10)
+    sp.add_argument("--multi-step", action="store_true",
+                    help="Run a real multi-step ReAct agent (think→tool→observe→"
+                         "repeat→FINAL), one LLM call per step, instead of single-shot")
+    sp.add_argument("--max-steps", type=int, default=8,
+                    help="Max tool steps for a --multi-step agent (default 8)")
     sp.set_defaults(func=cmd_spawn)
 
     sd = sub.add_parser("demo", help="M1 demo: 3 agents with mixed priorities")

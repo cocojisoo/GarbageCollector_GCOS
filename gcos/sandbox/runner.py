@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -41,7 +42,12 @@ class SandboxRunner(ABC):
     name: str = "base"
 
     @abstractmethod
-    def run_python(self, code: str, *, timeout: float = 5.0) -> SandboxResult:
+    def run_python(self, code: str, *, timeout: float = 5.0,
+                   cpu_shares: Optional[int] = None) -> SandboxResult:
+        """Run `code` under isolation. `cpu_shares` (when the runner supports it)
+        sets the container's relative CFS weight, so a higher-priority agent's
+        sandboxed code gets a proportionally larger CPU share when containers
+        compete — real per-agent kernel scheduling for the live CPU-bound work."""
         ...
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic

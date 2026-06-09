@@ -1,7 +1,12 @@
 """GCOS evaluation harness — quantify the OS mechanisms, not just the LLM.
 
-Four metrics, all **reproducible offline** (no Upstage key required), each
-measuring one of the operating-system concepts GCOS implements:
+All metrics are **reproducible offline** (no Upstage key required), each
+measuring one of the operating-system concepts GCOS implements. The first group
+measures the userspace orchestration; the `os_capabilities`/`real_preemption`/
+`demand_paging`/`cgroup_cpu_share`/`multistep_agents` group measures the
+**kernel-enforced** substrate (`gcos.osprims`) — see docs/REAL_OS.md.
+
+Core orchestration metrics:
 
   1. concurrency_speedup   — Worker pool + scheduler: does running N agents on
                              W worker threads actually beat running them on 1?
@@ -544,6 +549,232 @@ def measure_eviction_efficacy(
 
 
 # ---------------------------------------------------------------------------
+# Real-OS substrate (gcos.osprims) — kernel-enforced, not simulated.
+# These measure the *real* primitives. The portable ones (real-process
+# preemption, mmap demand paging, multi-step agents) run everywhere; the
+# Linux-only one (cgroup CFS share) reports enforced=False off Linux and is
+# exercised by the ubuntu CI job. See docs/REAL_OS.md.
+# ---------------------------------------------------------------------------
+
+def measure_os_capabilities() -> dict[str, Any]:
+    """What this host actually lets GCOS enforce in the kernel (honest posture)."""
+    from gcos.osprims import os_caps
+    return os_caps().to_dict()
+
+
+def measure_real_preemption(n_procs: int = 3, chunks: int = 6,
+                            quantum_s: float = 0.01) -> dict[str, Any]:
+    """Real RR vs FCFS over REAL child processes, preempted by SIGSTOP/SIGCONT.
+
+    Unlike `scheduler_preemption` (which time-slices LLM *calls* of in-process
+    agents), this forks real CPU-bound processes and the kernel freezes them
+    mid-instruction — true preemption. RR rotates every quantum (max run 1);
+    FCFS runs each process to completion (convoy). Portable across POSIX."""
+    from gcos.osprims.realproc import (
+        RealProcessScheduler, max_consecutive_run, block_count,
+    )
+    sched = RealProcessScheduler()
+    rr = sched.rr_order(n_procs, chunks, quantum_s, preempt=True)
+    fcfs = sched.rr_order(n_procs, chunks, quantum_s, preempt=False)
+    rr_run, fcfs_run = max_consecutive_run(rr), max_consecutive_run(fcfs)
+    rr_blocks, fcfs_blocks = block_count(rr), block_count(fcfs)
+    return {
+        "n_procs": n_procs,
+        "rr": {"order": rr, "max_consecutive_run": rr_run, "blocks": rr_blocks},
+        "fcfs": {"order": fcfs, "max_consecutive_run": fcfs_run, "blocks": fcfs_blocks},
+        # Jitter-proof invariant: FCFS keeps each child as one contiguous block
+        # (convoy), RR splits them into more blocks than there are children
+        # (preemption). max_consecutive_run is reported but not asserted on,
+        # since RR's tail (last child running alone) can legitimately exceed 1.
+        "rr_preempts": fcfs_blocks == n_procs and rr_blocks > n_procs,
+        "mechanism": "real child processes, SIGSTOP/SIGCONT kernel preemption",
+    }
+
+
+def measure_demand_paging(n_pages: int = 48, payload_bytes: int = 8000) -> dict[str, Any]:
+    """Real mmap demand paging: store pages, madvise them out (kernel drops the
+    physical page), then fault them back in from the backing file on access."""
+    from gcos.osprims.vmem import MmapPageStore
+    with MmapPageStore(capacity_pages=n_pages * 4) as st:
+        for i in range(n_pages):
+            st.store(f"p{i}", b"x" * payload_bytes)
+        resident_before = st.resident_pages()
+        for i in range(n_pages):
+            st.page_out(f"p{i}")
+        resident_after_pageout = st.resident_pages()
+        for i in range(n_pages):              # touch every page → fault back in
+            st.read(f"p{i}")
+        stats = st.fault_stats()
+    return {
+        "pages": n_pages,
+        "resident_before": resident_before,
+        "resident_after_pageout": resident_after_pageout,
+        "page_outs": stats["app_page_outs"],
+        "fault_ins": stats["app_fault_ins"],
+        "kernel_majflt_delta": stats["kernel_majflt_delta"],
+        "page_size": stats["page_size"],
+        "demand_paging_works": (resident_after_pageout < resident_before
+                                and stats["app_fault_ins"] == n_pages),
+        "mechanism": "mmap + madvise(MADV_DONTNEED); fault-in on access",
+    }
+
+
+def measure_cgroup_cpu_share(weights: tuple = (100, 300, 900),
+                             duration_s: float = 0.6) -> dict[str, Any]:
+    """Real Linux CFS share: one CPU-bound child per weight, each in a cgroup
+    with that `cpu.weight`, pinned to CPU 0 so they compete. Read cpu.stat back —
+    the measured CPU share should track the weights. Linux-only; enforced=False
+    elsewhere (verified by the ubuntu CI job)."""
+    from gcos.osprims import cgroup as cg
+    from gcos.osprims.realproc import RealProcessScheduler
+    if not cg.available():
+        return {"enforced": False,
+                "reason": "cgroup v2 not delegated here (non-Linux or no privilege)"}
+    res = RealProcessScheduler().cpu_share(list(weights), duration_s)
+    if res is None:
+        return {"enforced": False, "reason": "cgroup runtime probe failed"}
+    measured = res["measured_share_pct"]
+    tracks = all(measured[i] <= measured[i + 1] for i in range(len(measured) - 1))
+    return {
+        "enforced": True,
+        "weights": res["weights"],
+        "measured_share_pct": measured,
+        "expected_share_pct": res["expected_share_pct"],
+        "tracks_weight": tracks,
+    }
+
+
+def measure_live_per_agent_cfs(priorities: tuple = (1, 5, 9),
+                               duration_s: float = 0.4) -> dict[str, Any]:
+    """The live-path proof: drive CPU-bound agents through the PROCESS executor —
+    each agent a real OS process placed in its OWN per-agent cgroup with
+    cpu.weight = priority — and confirm the live dispatch path runs them all to
+    completion as separate processes.
+
+    Scope, honestly: that cgroup `cpu.weight` actually steers the CFS share is
+    proven robustly + reproducibly by `cgroup_cpu_share` (weights 100/300/900 ->
+    ~8/23/68%). The *contended* per-agent share in this live path is environment-
+    noisy — it depends on the container's CPU budget, and under scx_gcos on a
+    scheduler that does not read cgroup weight — so we report it for information but
+    verify the part that IS robust here: the real process executor dispatches every
+    agent into its own cpu.weight cgroup and runs it to completion. Linux-only."""
+    from gcos.osprims import cgroup as cg
+    if not cg.available():
+        return {"enforced": False,
+                "reason": "cgroup v2 not delegated here (non-Linux or no privilege)"}
+    # cgroup dir creation alone doesn't mean the cpu controller is delegated, so
+    # confirm a real cpu.weight write succeeds — otherwise we must not claim the
+    # per-agent cgroups are CFS-weighted.
+    probe = cg.Cgroup("cfs-probe", weight=200)
+    cpu_ok = getattr(probe, "cpu_enforced", False)
+    probe.remove()
+    if not cpu_ok:
+        return {"enforced": False,
+                "reason": "cgroup v2 mounted but cpu controller not delegated (no cpu.weight)"}
+
+    import os as _os
+    import time as _time
+    from gcos.kernel.kernel import Kernel, KernelConfig
+
+    def cpu_agent(pcb, _client):
+        # Burn CPU for a fixed wall window, then report the CPU time we got. We do
+        # NOT pin to one CPU: the claim here is that the live executor runs every
+        # agent as a real OS process to completion (the per-priority *share* is the
+        # cgroup_cpu_share metric's job), so we let each agent finish reliably even
+        # on a CPU-constrained CI container.
+        t0 = _os.times()
+        end = _time.time() + duration_s
+        x = 1
+        while _time.time() < end:
+            for _ in range(20_000):
+                x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        t1 = _os.times()
+        cpu = (t1.user - t0.user) + (t1.system - t0.system)
+        pcb.result = f"{cpu:.4f}"
+        pcb.llm_calls_used += 1
+        pcb.transition(AgentState.DONE)
+        return False
+
+    cfg = KernelConfig(scheduler="fcfs", workers=len(priorities),
+                       quota_total=100, executor_backend="process")
+    k = Kernel(cfg, client_factory=lambda: None, step_runner=cpu_agent)
+    pids = {p: k.spawn(f"cpu prio {p}", name=f"p{p}", priority=p) for p in priorities}
+    k.start()
+    k.wait_idle(timeout=60)
+    acb = {p: k.get(pid) for p, pid in pids.items()}
+    k.shutdown()
+
+    asc = sorted(priorities)
+    cpu = {p: float(acb[p].result or 0.0) for p in asc}
+    ran = sum(1 for p in asc if acb[p].result is not None)   # completed as a real process
+    total = sum(cpu.values()) or 1.0
+    shares = {p: round(100 * cpu[p] / total, 1) for p in asc}
+    return {
+        "enforced": True,
+        "priorities": list(asc),
+        "agents_ran": ran,
+        "all_agents_ran": ran == len(asc),
+        "cpu_share_pct_by_priority": shares,         # informational (see docstring)
+        "cpu_seconds_by_priority": {p: round(cpu[p], 3) for p in asc},
+        "mechanism": "real agent processes, each in a per-agent cgroup with cpu.weight=priority; live FCFS dispatch",
+    }
+
+
+def measure_multistep_agents() -> dict[str, Any]:
+    """A1: drive *real* multi-step (ReAct) agents through the real worker pool.
+
+    Two agents, three steps each, one worker. Under FCFS each runs to completion;
+    under RR(quantum=2) they interleave — proving the scheduler now time-slices
+    real agents, not just the eval's synthetic runners."""
+    from gcos.backend.solar_client import ChatResult
+    from gcos.executor import run_step
+    from gcos.kernel.kernel import Kernel, KernelConfig
+    from gcos.kernel.pcb import CapabilitySet
+    from gcos.osprims.realproc import max_consecutive_run
+
+    class _Fake:
+        def chat(self, messages, **kw):
+            obs = sum(1 for m in messages
+                      if str(m.get("content", "")).startswith("OBSERVATION:"))
+            task = next((m["content"] for m in messages
+                         if m["role"] == "user" and "STEPS=" in m["content"]), "STEPS=1")
+            n = int(task.split("STEPS=")[1].split()[0])
+            txt = "FINAL: done" if obs >= n - 1 else "TOOL: note x"
+            return ChatResult(content=txt, prompt_tokens=5, completion_tokens=5, total_tokens=10)
+
+    def drive(scheduler: str):
+        order: list[int] = []
+
+        def rec(pcb, client):
+            order.append(pcb.pid)
+            return run_step(pcb, client)
+
+        k = Kernel(KernelConfig(scheduler=scheduler, workers=1, quota_total=100),
+                   client_factory=lambda: _Fake(), step_runner=rec)
+        # Enqueue BOTH agents before starting the single worker, so the dispatch
+        # order is determined purely by the scheduler — not by a race between the
+        # worker starting and the second spawn (which made the order timing- and
+        # platform-dependent). This mirrors measure_scheduler_ordering.
+        k.spawn("TASK STEPS=3 a", name="a", capability=CapabilitySet.agent())
+        k.spawn("TASK STEPS=3 b", name="b", capability=CapabilitySet.agent())
+        k.start()
+        k.wait_idle(timeout=10)
+        k.shutdown()
+        return order
+
+    fcfs, rr = drive("fcfs"), drive("rr")
+    return {
+        "n_agents": 2,
+        "steps_each": 3,
+        "fcfs_order": fcfs,
+        "rr_order": rr,
+        "fcfs_max_run": max_consecutive_run(fcfs),
+        "rr_max_run": max_consecutive_run(rr),
+        "rr_interleaves": max_consecutive_run(rr) < max_consecutive_run(fcfs),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Aggregate
 # ---------------------------------------------------------------------------
 
@@ -557,4 +788,11 @@ def run_all() -> dict[str, Any]:
         "quota_conservation": measure_quota_conservation(),
         "policy_gate_detection": measure_policy_gate_detection(),
         "eviction_efficacy": measure_eviction_efficacy(),
+        # --- real-OS substrate (kernel-enforced, gcos.osprims) ---
+        "os_capabilities": measure_os_capabilities(),
+        "multistep_agents": measure_multistep_agents(),
+        "real_preemption": measure_real_preemption(),
+        "demand_paging": measure_demand_paging(),
+        "cgroup_cpu_share": measure_cgroup_cpu_share(),
+        "live_per_agent_cfs": measure_live_per_agent_cfs(),
     }

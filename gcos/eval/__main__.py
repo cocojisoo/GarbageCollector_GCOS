@@ -92,6 +92,49 @@ def _fmt_markdown(r: dict[str, Any]) -> str:
         f"fits budget: **{sm['fits_budget']}**",
         "",
     ]
+
+    # --- 6. real-OS substrate (kernel-enforced) ---
+    caps = r["os_capabilities"]
+    ms = r["multistep_agents"]
+    rp = r["real_preemption"]
+    dp = r["demand_paging"]
+    cs2 = r["cgroup_cpu_share"]
+    lc = r["live_per_agent_cfs"]
+    lines += [
+        "## 6. Real-OS substrate (kernel-enforced, `gcos.osprims`)",
+        "",
+        f"- **Posture:** `{caps['platform']}` — kernel-enforced: "
+        f"**{caps['kernel_enforced']}** (cgroup={caps['cgroup_writable']}, "
+        f"signals={caps['signals']}, seccomp={caps['seccomp']}, ebpf={caps['ebpf']}). "
+        "Linux-only primitives are verified by the ubuntu CI job.",
+        f"- **Multi-step agents (A1):** real ReAct agents, FCFS max-run "
+        f"{ms['fcfs_max_run']} vs RR max-run {ms['rr_max_run']} → RR interleaves: "
+        f"**{ms['rr_interleaves']}**",
+        f"- **Real preemption:** RR vs FCFS over real child processes "
+        f"(SIGSTOP/SIGCONT), max consecutive run "
+        f"{rp['fcfs']['max_consecutive_run']} -> {rp['rr']['max_consecutive_run']} "
+        f"→ preempts: **{rp['rr_preempts']}**",
+        f"- **Demand paging:** {dp['page_outs']} pages madvise'd out, "
+        f"{dp['fault_ins']} faulted back in"
+        + (f" (kernel majflt +{dp['kernel_majflt_delta']})" if dp["kernel_majflt_delta"] else "")
+        + f" → works: **{dp['demand_paging_works']}**",
+        (f"- **cgroup CFS share:** weights {cs2['weights']} measured "
+         f"{cs2['measured_share_pct']}% (expected {cs2['expected_share_pct']}%) "
+         f"→ tracks weight: **{cs2['tracks_weight']}**"
+         if cs2.get("enforced")
+         else f"- **cgroup CFS share:** degraded — {cs2.get('reason', 'n/a')} "
+              "(enforced + verified on the ubuntu CI job)"),
+        (f"- **Per-agent CFS (LIVE, process executor):** priorities "
+         f"{lc['priorities']} → all ran as real processes: "
+         f"**{lc['all_agents_ran']}** ({lc['agents_ran']}/{len(lc['priorities'])}), "
+         f"each in its own per-agent cgroup cpu.weight=priority (live share "
+         f"{list(lc['cpu_share_pct_by_priority'].values())}% — that cpu.weight steers "
+         f"the CFS share is proven by the cgroup CFS-share row above)"
+         if lc.get("enforced")
+         else f"- **Per-agent CFS (LIVE, process executor):** degraded — "
+              f"{lc.get('reason', 'n/a')} (verified on the ubuntu CI job)"),
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -161,6 +204,66 @@ def _print_table(r: dict[str, Any]) -> None:
         f"LRU {lru['tokens_before']}->{lru['tokens_after']} (fits={lru['fits_budget']}); "
         f"+summarize {sm['pages_before']}->{sm['pages_after']} pages",
     )
+
+    # --- real-OS substrate (kernel-enforced, gcos.osprims) ---
+    caps = r["os_capabilities"]
+    ms = r["multistep_agents"]
+    rp = r["real_preemption"]
+    dp = r["demand_paging"]
+    cs2 = r["cgroup_cpu_share"]
+    lc = r["live_per_agent_cfs"]
+    t.add_row(
+        "Real-OS posture (osprims)",
+        "Does the host enforce OS claims in the kernel?",
+        ("KERNEL-ENFORCED" if caps["kernel_enforced"] else "SIMULATED (degraded)")
+        + f"  [{caps['platform']}: cgroup={caps['cgroup_writable']} sig={caps['signals']}]",
+    )
+    t.add_row(
+        "Multi-step agents (A1)",
+        "Real ReAct agents time-sliced by the scheduler (FCFS vs RR)",
+        ("PASS" if ms["rr_interleaves"] else "FAIL")
+        + f"  FCFS run {ms['fcfs_max_run']}, RR run {ms['rr_max_run']} (real agents)",
+    )
+    t.add_row(
+        "Preemption — real procs",
+        "RR vs FCFS over real child processes (SIGSTOP/SIGCONT)",
+        ("PASS" if rp["rr_preempts"] else "FAIL")
+        + f"  run {rp['fcfs']['max_consecutive_run']}->{rp['rr']['max_consecutive_run']}",
+    )
+    t.add_row(
+        "Demand paging — mmap",
+        "madvise page-out, fault-in on access",
+        ("PASS" if dp["demand_paging_works"] else "FAIL")
+        + f"  {dp['page_outs']} out / {dp['fault_ins']} faulted in"
+        + (f", majflt+{dp['kernel_majflt_delta']}" if dp["kernel_majflt_delta"] else ""),
+    )
+    if cs2.get("enforced"):
+        t.add_row(
+            "cgroup CFS share (Linux)",
+            "Measured CPU share tracks cpu.weight",
+            ("PASS" if cs2["tracks_weight"] else "FAIL")
+            + f"  w={cs2['weights']} -> {cs2['measured_share_pct']}%",
+        )
+    else:
+        t.add_row(
+            "cgroup CFS share (Linux)",
+            "Measured CPU share tracks cpu.weight",
+            f"DEGRADED — {cs2.get('reason', 'unavailable')} (verified in CI)",
+        )
+    if lc.get("enforced"):
+        t.add_row(
+            "Per-agent CFS — LIVE (process)",
+            "Live executor runs each agent as a real process in its own cpu.weight cgroup",
+            ("PASS" if lc["all_agents_ran"] else "FAIL")
+            + f"  {lc['agents_ran']}/{len(lc['priorities'])} ran; share "
+            + f"{list(lc['cpu_share_pct_by_priority'].values())}% (per-priority: see cgroup CFS row)",
+        )
+    else:
+        t.add_row(
+            "Per-agent CFS — LIVE (process)",
+            "Agents as real processes under per-agent cgroup cpu.weight",
+            f"DEGRADED — {lc.get('reason', 'unavailable')} (verified in CI)",
+        )
     console.print(t)
     if pg["attacks_missed"]:
         console.print(

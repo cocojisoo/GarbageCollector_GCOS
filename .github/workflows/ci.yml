@@ -1,0 +1,134 @@
+name: CI
+
+# Runs the whole suite + the eval harness on real Linux, and — crucially —
+# verifies the Linux-only real-OS primitives (cgroup v2 CFS shares, seccomp,
+# real-process preemption) that a macOS dev box cannot exercise. This is what
+# makes the "kernel-enforced, not simulated" claim checkable on every push,
+# rather than merely asserted. See docs/REAL_OS.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests + eval (ubuntu, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Pytest
+        run: pytest -q
+      - name: Eval harness (mechanism metrics)
+        run: python -m gcos.eval
+
+  kernel-enforcement:
+    name: verify cgroup CFS + preemption + daemon cgroup (privileged Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Run the stdlib-only osprims primitives inside a privileged container so
+      # cgroup v2 is delegated and writable — exactly the path macOS can't run.
+      # The verification is a real script file (NOT a stdin heredoc, which
+      # `docker run` without -i silently drops, making the check vacuous); it
+      # exits non-zero if the kernel doesn't enforce proportional CPU shares.
+      - name: cgroup CFS share + real preemption + daemon cgroup
+        run: |
+          docker run --rm --privileged --cgroupns=host \
+            -v "$PWD":/app -w /app python:3.11-slim \
+            python3 scripts/ci/verify_kernel_enforcement.py
+      - name: per-agent CFS in the LIVE path (process executor)
+        run: |
+          docker run --rm --privileged --cgroupns=host \
+            -v "$PWD":/app -w /app python:3.11-slim \
+            bash -c 'pip install -q -e . && python3 scripts/ci/verify_live_cfs.py'
+
+  ebpf:
+    name: load + run our eBPF program (privileged Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Actually COMPILE + LOAD gcos/osprims/ebpf/gcos_sched.bpf.c into the kernel
+      # and read back real per-PID sched_switch data — so "we ship our own ring-0
+      # code" is verified by execution, not just by construction. Needs bcc +
+      # kernel headers + privilege; the loader auto-mounts tracefs.
+      - name: compile + load gcos_sched.bpf.c and collect kernel data
+        run: |
+          docker run --rm --privileged -v "$PWD":/app -w /app ubuntu:24.04 bash -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq python3-bpfcc linux-headers-$(uname -r)
+            python3 scripts/ci/verify_ebpf.py
+          '
+
+  scx-ext:
+    name: build + load GCOS's sched_ext scheduler (scx_gcos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sched_ext present?
+        run: |
+          echo "runner kernel: $(uname -r)"
+          [ -d /sys/kernel/sched_ext ] && echo "sched_ext: PRESENT" || { echo "sched_ext ABSENT — cannot load scx_gcos"; exit 1; }
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libelf-dev zlib1g-dev libbpf-dev libcap-dev binutils-dev make git pkg-config python3 python3-pip
+      - name: build bpftool + matching libbpf from source (version-agnostic)
+        run: |
+          git clone --recurse-submodules --depth 1 https://github.com/libbpf/bpftool /tmp/bpftool
+          make -C /tmp/bpftool/src -j"$(nproc)"
+          /tmp/bpftool/src/bpftool version
+          # The generated skeleton uses struct_ops auto-attach (needs libbpf>=1.5,
+          # newer than Ubuntu's). Install the libbpf bundled with this bpftool.
+          make -C /tmp/bpftool/libbpf/src BUILD_STATIC_ONLY=1 PREFIX=/tmp/libbpf install install_uapi_headers
+          find /tmp/libbpf \( -name 'libbpf.a' -o -name 'libbpf.h' \) | head
+      - name: clone scx headers (scx/common.bpf.h, scx/common.h)
+        run: |
+          # Pin to v1.1.0: it targets kernels <= 6.17 (the latest scx 'main'
+          # references select_cpu_and structs that only exist on 6.18+ BTF).
+          git clone --depth 1 --branch v1.1.0 https://github.com/sched-ext/scx /tmp/scx
+          ls /tmp/scx/scheds/include/scx/ | head
+      - name: build scx_gcos.bpf.o + skeleton + loader
+        run: |
+          cd scripts/scx
+          LIBBPF_A=$(find /tmp/libbpf -name libbpf.a | head -1)
+          echo "libbpf.a: $LIBBPF_A"
+          make BPFTOOL=/tmp/bpftool/src/bpftool SCX_INC=/tmp/scx/scheds/include \
+               LIBBPF_INC=/tmp/libbpf/include LIBBPF_A="$LIBBPF_A"
+          file scx_gcos
+      - name: load scx_gcos (our kernel scheduler) + run agents under it
+        run: |
+          # venv avoids the debian-managed-package pip conflict on the runner.
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q -e .
+          echo "--- loading GCOS's scheduler into the kernel ---"
+          sudo ./scripts/scx/scx_gcos > /tmp/scx.log 2>&1 &
+          LOADER=$!
+          sleep 5
+          cat /tmp/scx.log || true
+          echo "--- sched_ext state (should be 'enabled' + scheduler 'gcos') ---"
+          sudo cat /sys/kernel/sched_ext/state 2>/dev/null || true
+          sudo find /sys/kernel/sched_ext -maxdepth 2 -name ops -exec sh -c 'echo "ops: $(cat "$1")"' _ {} \; 2>/dev/null || true
+          if ! sudo cat /sys/kernel/sched_ext/state 2>/dev/null | grep -qi enabled; then
+            echo "scx_gcos did NOT attach — loader log above"; sudo kill "$LOADER" 2>/dev/null || true; exit 1
+          fi
+          # With OUR scheduler in control of every CPU, confirm GCOS agents still run
+          # correctly as real processes under it (per-priority CPU share is proven by
+          # the cgroup CFS-share gate in the kernel-enforcement job, not here).
+          echo "--- GCOS agents running UNDER scx_gcos ---"
+          sudo /tmp/venv/bin/python scripts/ci/verify_live_cfs.py
+          sudo kill "$LOADER" 2>/dev/null || true
+          wait "$LOADER" 2>/dev/null || true

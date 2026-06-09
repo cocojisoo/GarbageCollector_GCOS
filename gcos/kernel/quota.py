@@ -29,6 +29,17 @@ class Quota:
             self._remaining -= n
             return True
 
+    def acquire_up_to(self, n: int) -> int:
+        """Reserve up to `n` units atomically; return how many were granted
+        (0..n). Admission control for the process executor: reserve an agent's
+        budget BEFORE it runs so agents can't collectively exceed the OS budget,
+        and refund the unspent remainder afterwards (vs. charging after the fact,
+        which has no admission control and silently under-charges when low)."""
+        with self._lock:
+            take = max(0, min(n, self._remaining))
+            self._remaining -= take
+            return take
+
     def acquire_blocking(self, n: int = 1, timeout: float | None = None) -> bool:
         """Block until `n` units are available (or timeout)."""
         with self._refunded_event:

@@ -10,16 +10,18 @@ Two entry points:
 - `run_agent(pcb, client)` — convenience wrapper: loops `run_step` until
   the agent terminates. Used by the M1 CLI and tests.
 
-Agent model — honest scope (F17): **agents are currently single-shot.** A plain
-or coder step makes exactly one LLM call and goes terminal ("one successful
-call → DONE"); `run_step` never returns True today. The *infrastructure* around
-it is already multi-step capable — the worker runs up to a scheduler quantum of
-calls per dispatch and re-queues unfinished agents (see worker_pool / RR) — so
-adding a real multi-step tool-use loop is a change to this module, not the
-kernel. That loop (assistant emits a tool call → execute → feed back → repeat)
-is deliberately future work, not claimed as done. So GCOS today is best
-described as "one prompt → one response" agents wired together over IPC, not
-autonomous multi-step agents.
+Agent model — honest scope (F17, updated): there are now **two** agent kinds.
+- *Single-shot* (default for plain chat and the coder): one LLM call → terminal
+  ("one successful call → DONE"); `run_step` returns False.
+- *Multi-step* (`CapabilitySet.agent()`, `multi_step=True`): a real ReAct loop in
+  `gcos.agent_loop` — think → tool → observe → repeat → FINAL — that makes one
+  LLM call per step and returns True until the agent finishes. This is what makes
+  the worker pool's quantum / re-queue / RR preemption time-slice a *real* agent
+  against its peers, not just the eval's synthetic runners.
+The multi-step tool set is intentionally small and offline-capable (calc, note)
+so the loop is fully testable without a network; richer tools (sandbox exec, IPC)
+build on the same protocol. We don't oversell it: the default path is still
+single-shot, and `multi_step` must be opted into per agent.
 """
 
 from __future__ import annotations
@@ -81,6 +83,11 @@ def run_step(pcb: AgentControlBlock, client: Optional[SolarClient] = None) -> bo
     If the agent has `capability.can_exec_code`, route through the coder path
     (policy gate → Solar → code extract → sandbox). Otherwise, plain chat.
     """
+    if pcb.capability.multi_step:
+        # Real multi-step ReAct agent: many LLM calls per task, so the
+        # scheduler's quantum genuinely time-slices it against peers (A1).
+        from gcos.agent_loop import run_react_step
+        return run_react_step(pcb, client)
     if pcb.capability.can_exec_code:
         # Lazy import: coder imports sandbox which is independent of executor.
         from gcos.coder import run_coder_step

@@ -169,9 +169,15 @@ def run_coder_step(
         log.warning("PID %d code blocked: rule=%s", pcb.pid, gate_code.rule)
         return False
 
-    # 5. Sandbox
+    # 5. Sandbox — map the agent's priority onto the container's CFS weight so a
+    # higher-priority coder's code gets a larger CPU share when sandboxes compete
+    # (real per-agent kernel scheduling for the live CPU-bound work).
+    from gcos.osprims.cgroup import priority_to_cpu_shares
     sb = sandbox or make_runner()
-    sandbox_out = sb.run_python(code, timeout=min(pcb.timeout_s, 10.0))
+    sandbox_out = sb.run_python(
+        code, timeout=min(pcb.timeout_s, 10.0),
+        cpu_shares=priority_to_cpu_shares(pcb.priority),
+    )
     pcb.result = _format_sandbox_result(reply, sandbox_out)
     if sandbox_out.ok:
         pcb.transition(AgentState.DONE)

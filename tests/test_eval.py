@@ -102,4 +102,47 @@ def test_run_all_returns_every_metric():
         "quota_conservation",
         "policy_gate_detection",
         "eviction_efficacy",
+        # real-OS substrate (gcos.osprims)
+        "os_capabilities",
+        "multistep_agents",
+        "real_preemption",
+        "demand_paging",
+        "cgroup_cpu_share",
+        "live_per_agent_cfs",
     }
+
+
+def test_real_preemption_metric_rr_beats_fcfs():
+    from gcos.eval import measure_real_preemption
+    r = measure_real_preemption(n_procs=3, chunks=6, quantum_s=0.01)
+    # Real child processes, real SIGSTOP/SIGCONT. Jitter-proof invariant: FCFS
+    # keeps each child as one contiguous block (3 blocks), RR interleaves them
+    # into more blocks than children.
+    assert r["fcfs"]["blocks"] == 3
+    assert r["rr"]["blocks"] > 3
+    assert r["rr_preempts"] is True
+
+
+def test_multistep_agents_metric_rr_interleaves_real_agents():
+    from gcos.eval import measure_multistep_agents
+    r = measure_multistep_agents()
+    assert r["rr_interleaves"] is True
+    assert r["fcfs_max_run"] == 3 and r["rr_max_run"] == 2
+
+
+def test_demand_paging_metric_faults_pages_back_in():
+    from gcos.eval import measure_demand_paging
+    r = measure_demand_paging(n_pages=16, payload_bytes=8000)
+    assert r["resident_after_pageout"] < r["resident_before"]
+    assert r["fault_ins"] == 16
+    assert r["demand_paging_works"] is True
+
+
+def test_cgroup_cpu_share_metric_is_honest_about_enforcement():
+    from gcos.eval import measure_cgroup_cpu_share
+    from gcos.osprims import cgroup as cg
+    r = measure_cgroup_cpu_share(weights=(100, 900), duration_s=0.3)
+    if cg.available():
+        assert r["enforced"] is True and "measured_share_pct" in r
+    else:
+        assert r["enforced"] is False and "reason" in r

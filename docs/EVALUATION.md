@@ -162,7 +162,7 @@ and reflection (`getattr(os, 'sys'+'tem')`) — so the number reflects reality.
 | Metric | Value |
 |---|---|
 | Attacks caught | 27 / 29 (**93.1%** recall) |
-| False positives on benign input | 0 / 20 (**0.0% FPR**) |
+| False positives on benign input | 0 / 21 (**0.0% FPR**) |
 | Precision | **100%** |
 | Known blind spots (by design) | `f = os.system; f('id')`, `getattr(os, 'sys'+'tem')('id')` |
 
@@ -195,6 +195,49 @@ This is the paging mechanism doing its job.
 
 ---
 
+## 5. Real-OS substrate — kernel-enforced, not simulated (`gcos.osprims`)
+
+The metrics above measure the userspace *orchestration*. This group measures the
+**real kernel primitives** that back the same claims. Full design + verification
+matrix in `docs/REAL_OS.md`. Linux is first-class; on macOS the Linux-only rows
+report `enforced=False` and the ubuntu CI jobs exercise them on real Linux
+(including loading GCOS's own `scx_gcos` CPU scheduler into the kernel).
+
+| Metric | OS concept | What it proves | Runs on |
+|---|---|---|---|
+| `os_capabilities` | — | honest posture: is the host kernel-enforcing or simulating? | all |
+| `multistep_agents` | scheduling | real ReAct agents interleave under RR, run-to-completion under FCFS (A1) | all |
+| `real_preemption` | scheduling | RR vs FCFS over **real processes**, SIGSTOP/SIGCONT preemption | all (POSIX) |
+| `demand_paging` | virtual memory | mmap + madvise page-out, real fault-in on access | all (POSIX) |
+| `cgroup_cpu_share` | resource control | measured CPU share tracks cgroup `cpu.weight` (real Linux CFS) | Linux / CI |
+
+**Method.** `real_preemption` forks real CPU-bound children and time-slices them
+with `SIGSTOP`/`SIGCONT` (RR) or runs each to completion (FCFS). The jitter-proof
+signal of preemption: FCFS keeps each child as **one contiguous block** (N
+children → N blocks, the convoy), while RR **interleaves** them into many more
+blocks than there are children. (RR's per-child max run isn't exactly 1 — the
+last child legitimately runs alone at the tail — so we assert on block count,
+not max run.) True preemption, not cooperative yielding.
+`demand_paging` stores pages in a file-backed `mmap`, `madvise(MADV_DONTNEED)`s
+them out (the kernel drops the physical page), and faults them back in on read.
+`cgroup_cpu_share` puts one CPU-bound child per `cpu.weight` in its own cgroup,
+pins them to one CPU so they compete, and reads `cpu.stat` back.
+
+**Reference result (real Linux, privileged container).**
+
+| `cpu.weight` | expected share | measured share |
+|---:|---:|---:|
+| 100 | 7.7% | 7.9% |
+| 300 | 23.1% | 23.5% |
+| 900 | 69.2% | 68.5% |
+
+The measured CPU share tracks the weights to within ~1% — the **Linux CFS
+scheduler**, not a Python loop, is allocating the CPU. This is the reproducible
+analogue of the hand-measured CFS-share benchmarks in the strongest kernel
+projects, and the headline evidence that GCOS's resource control is real.
+
+---
+
 ## What this harness does NOT measure (and why)
 
 - **Summarize-eviction quality.** The reproducible run uses a fake summarizer,
@@ -217,5 +260,5 @@ The speedup metric is timing-dependent and will vary with machine load; the
 test asserts only that parallel beats serial by a comfortable margin, not an
 exact ratio. The gate corpus is small and hand-built — it demonstrates the
 filter's behaviour and its known blind spots, but is not an exhaustive security
-audit. All four metrics are mechanism-level; they show the OS components work,
+audit. Every metric here is mechanism-level; they show the OS components work,
 which is the claim the project needs to support.

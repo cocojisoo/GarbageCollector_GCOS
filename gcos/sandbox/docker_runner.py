@@ -7,6 +7,7 @@ Each `run_python(code)` call:
         --read-only \\
         --cap-drop=ALL \\
         --security-opt=no-new-privileges \\
+        --security-opt=seccomp=<gcos profile: ERRNO on socket/ptrace/mount/bpf/...> \\
         --memory=128m --memory-swap=128m \\
         --pids-limit=64 \\
         --cpus=1 \\
@@ -29,6 +30,7 @@ uses to decide whether to pick this or fall back to SubprocessSandboxRunner.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Optional
@@ -59,6 +61,7 @@ class DockerSandboxRunner(SandboxRunner):
         tmpfs_size: str = "8m",
         user: str = "65534:65534",        # nobody:nogroup — never run as root (D13)
         max_output_bytes: int = 64 * 1024,  # cap captured stdout/stderr (D13)
+        seccomp: bool = True,               # kernel-enforced syscall allowlist
     ) -> None:
         self.image = image
         self.memory = memory
@@ -67,6 +70,16 @@ class DockerSandboxRunner(SandboxRunner):
         self.tmpfs_size = tmpfs_size
         self.user = user
         self.max_output_bytes = max_output_bytes
+        # A seccomp-bpf profile the *kernel* enforces on every syscall the
+        # sandboxed code makes — defence beyond the bypassable regex gate. Built
+        # once and passed inline via --security-opt seccomp=<json>. The container
+        # runtime applies it on Linux; harmless string elsewhere.
+        self._security_opt = ["no-new-privileges"]
+        if seccomp:
+            from gcos.osprims.seccomp import docker_seccomp_profile
+            self._security_opt.append(
+                "seccomp=" + json.dumps(docker_seccomp_profile(), separators=(",", ":"))
+            )
         self._client = self._connect()
 
     # --- factory bits ------------------------------------------------------
@@ -107,7 +120,8 @@ class DockerSandboxRunner(SandboxRunner):
             text += f"\n...[truncated at {self.max_output_bytes} bytes]"
         return text
 
-    def run_python(self, code: str, *, timeout: float = 5.0) -> SandboxResult:
+    def run_python(self, code: str, *, timeout: float = 5.0,
+                   cpu_shares: Optional[int] = None) -> SandboxResult:
         import docker  # type: ignore  # noqa: F401  (proves availability)
 
         start = time.monotonic()
@@ -141,12 +155,16 @@ class DockerSandboxRunner(SandboxRunner):
                 network_mode="none",
                 read_only=True,
                 cap_drop=["ALL"],
-                security_opt=["no-new-privileges"],
+                security_opt=self._security_opt,  # no-new-privileges + seccomp (D13)
                 user=self.user,                 # non-root inside the container (D13)
                 mem_limit=self.memory,
                 memswap_limit=self.memory,
                 pids_limit=self.pids_limit,
                 nano_cpus=int(self.cpus * 1_000_000_000),
+                # Per-agent CFS weight: higher-priority agents' sandboxed code
+                # gets a larger CPU share when containers compete (real kernel
+                # scheduling, since each sandbox is its own process). None -> default.
+                cpu_shares=cpu_shares,
                 # mode=1777 so the non-root user can write /work/main.py.
                 tmpfs={"/work": f"rw,size={self.tmpfs_size},exec,mode=1777"},
                 working_dir="/work",

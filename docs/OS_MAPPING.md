@@ -3,6 +3,29 @@
 This table shows how each classical OS concept is realized in GCOS.
 Use this as the *first* thing to point at when defending the project.
 
+## The LLM inside the OS (the "for LLM" part)
+
+Most of this project is "OS concepts applied to LLM agents" — the agents are the
+*workload*. The distinctive claim of **OS _for_ LLM** is the opposite direction:
+the OS itself **uses the LLM inside its own mechanisms**. Today that lives in one
+place, and it is the signature feature:
+
+- **Memory manager → summarize-eviction** (`memory/evict_summarize.py`,
+  concept #14). When an agent's context exceeds its token budget, the pager
+  doesn't just drop old pages (LRU) — it issues a **real Solar call to compress**
+  the oldest N pages into a single summary page. Crucially, that call goes
+  *through the OS's own machinery*: it is rate-limited by the request batcher and
+  **charged to the shared OS quota** (refunded on failure), so memory management
+  can't sneak around the OS's throttle (B5). **The OS uses the LLM to manage the
+  LLM's own memory** — the workload is also a kernel mechanism.
+
+Honest scope: this is currently the *only* place the LLM drives an OS decision;
+everywhere else the policies are classical (FCFS/Priority/RR scheduling, LRU
+choice, regex gate). Natural ways to deepen the thread — LLM-informed page-
+replacement *choice* (semantic importance, not just compression), or
+LLM-classified agent priority/quantum — are noted as the next step, not claimed
+as done.
+
 | # | OS Concept | Where it lives | What it does | Direction-A requirement matched |
 |---|---|---|---|---|
 | 1 | Process | `kernel/pcb.py::AgentControlBlock` | One running LLM agent = one PCB | "multiple concurrent LLM processes" |
@@ -13,7 +36,7 @@ Use this as the *first* thing to point at when defending the project.
 | 6 | Preemption boundary | `worker_pool.py` (quantum = N LLM calls) | A worker runs the picked agent for up to `scheduler.quantum` calls, then yields it to the tail. **FCFS quantum=None → non-preemptive** (run to completion); **Priority=1** (re-pick each call); **RR=k** (rotate every k). Preemption *inside* a single non-streaming call isn't possible, so the boundary is between calls. | "GPU/CPU hand-off"-like |
 | 7 | CPU / cores | `kernel/worker_pool.py` | N threads, Condition var, fair pick | "fair CPU allocation" |
 | 8 | Quota / rlimit | `kernel/quota.py` | Mutex-protected shared API budget | "tool-quota allocation" |
-| 9 | Capability-based ACL | `kernel/capability.py::CapabilitySet` | Per-agent `{can_net, can_fs_write, can_spawn_child, can_exec_code, max_tokens, max_tool_calls}` | "file/shell tool permissions" |
+| 9 | Capability-based ACL | `kernel/pcb.py::CapabilitySet` | Per-agent `{can_call_llm, can_exec_code, can_net, can_fs_write, can_spawn_child, multi_step, allowed_paths, max_tokens, max_tool_calls}` | "file/shell tool permissions" |
 | 10 | Process tree (fork) | `kernel/process_tree.py::ProcessTree` | `children_of`, `descendants_of`, `reap_descendants` (cascade ZOMBIE on parent kill), `tree_view` for `ps --tree` | — |
 | 11 | IPC pipe / mailbox | `ipc/message_bus.py::MessageBus` | bounded `queue.Queue` per PID, `send/recv/has_pending`, `resolve_input_placeholder({INPUT})` | "concurrent LLM processes" |
 | 11b | Atomic spawn wiring | `kernel/pid_alloc.py::PidAllocator.peek()` | Lets producer & consumer be wired (`pipe_to`+`input_from`) before either runs — fixes the obvious race | — |
@@ -35,9 +58,29 @@ Use this as the *first* thing to point at when defending the project.
 | 25 | Process tree view | `shell/repl.py::cmd_tree` + `ProcessTree.tree_view` | `ps --tree` style indented listing. | — |
 | 26 | `mem` / pager stats | `shell/repl.py::cmd_mem` + `ContextPager.stats()` | Per-PID page list with flags (`pinned`, `summarized`), tokens, budget, overflow. | "memory inspection" |
 
-## What we deliberately did *not* implement (and why)
+## Real-OS substrate — kernel-enforced primitives (`gcos.osprims`)
 
-- **Kernel-mode code / real syscalls** — Direction A is explicitly application-level OS for LLMs.
-- **True preemption inside an LLM call** — HTTP calls are atomic from the OS's POV. We preempt *between* calls (quantum = N LLM calls).
-- **Multi-step / autonomous agents (F17)** — agents are single-shot today (one prompt → one response). The worker pool, quantum, and re-queue machinery are multi-step-ready, but the executor doesn't yet run a tool-use loop. GCOS is single-shot agents *composed* over IPC, not autonomous agents — stated so the framing isn't oversold.
+The rows above describe the userspace *orchestration*; these make the same
+claims **enforced by the host kernel** (Linux first-class; macOS degrades
+loudly). Full detail + verification matrix in [`REAL_OS.md`](REAL_OS.md).
+
+| # | OS Concept | Kernel primitive | Module | Verified |
+|---|---|---|---|---|
+| K1 | Proportional CPU scheduling | cgroup v2 `cpu.weight` → Linux CFS (measured share tracks weight) | `osprims/cgroup.py` | Linux container + CI |
+| K2 | Resource limits | cgroup v2 `cpu.max`/`memory.max`/`pids.max` | `osprims/cgroup.py` | Linux + CI |
+| K3 | True preemption | `SIGSTOP`/`SIGCONT`/`SIGKILL` on real processes | `osprims/preempt.py`, `realproc.py` | macOS + Linux + CI |
+| K4 | Demand paging | `mmap` + `madvise(MADV_DONTNEED)`, fault-in on access | `osprims/vmem.py` | macOS + Linux + CI |
+| K5 | IPC | POSIX shared memory (`shm_open`) | `osprims/shm.py` | macOS + Linux + CI |
+| K6 | Syscall boundary | seccomp-bpf allowlist (Docker `--security-opt`) | `osprims/seccomp.py` | Linux + CI |
+| K7 | In-kernel code | our own eBPF on `sched_switch` (CI compiles + loads it) | `osprims/ebpf/` | Linux + CI (bcc+root) |
+| K8 | Multi-step agents | real ReAct loop; scheduler time-slices a real agent | `agent_loop.py` | macOS + Linux + CI |
+| K9 | OS budget (live) | daemon cgroup `pids.max`/`memory.max`/`cpu.max` at boot | `kernel.start`→`cgroup.place_daemon` | Linux + CI |
+| K10 | Per-agent CFS (live, sandbox) | sandboxed code's `cpu_shares` from agent priority | `coder.py`→`priority_to_cpu_shares` | Linux + CI |
+| K11 | Per-agent CFS (live, all work) | each agent a real process under per-agent `cpu.weight` | `kernel/process_pool.py` (`GCOS_EXEC=process`) | Linux + CI |
+| K12 | **Our OWN ring-0 CPU scheduler** | sched_ext scheduler we wrote (slice ∝ `p->scx.weight`); CI loads it so **our code dispatches every task** (`state`=enabled, `ops`=gcos) and runs GCOS agents under it. (Per-priority CPU *share* is K10/cgroup CFS, not scx — scx_gcos doesn't read cgroup weight.) | `osprims/ebpf/scx_gcos.bpf.c` + `scripts/scx/` | Linux ≥ 6.12 + CI |
+
+## What we deliberately did *not* (fully) implement (and why)
+- **True preemption inside an LLM call** — HTTP calls are atomic from the OS's
+  POV. We preempt *between* calls for in-process agents, and with real SIGSTOP/
+  SIGKILL for real agent processes (`process_pool`, `realproc`).
 - **Multi-tenant networking** — out of scope; one Solar key, one machine.

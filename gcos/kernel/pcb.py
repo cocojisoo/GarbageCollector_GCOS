@@ -77,6 +77,7 @@ class CapabilitySet:
     can_net: bool = False
     can_fs_write: bool = False
     can_spawn_child: bool = False
+    multi_step: bool = False     # drive the real ReAct multi-step loop (A1)
     allowed_paths: list[str] = field(default_factory=list)
     max_tokens: int = 4096
     max_tool_calls: int = 20
@@ -88,6 +89,12 @@ class CapabilitySet:
     @classmethod
     def coder(cls) -> "CapabilitySet":
         return cls(can_exec_code=True, can_spawn_child=True, max_tokens=8192)
+
+    @classmethod
+    def agent(cls, max_tool_calls: int = 8) -> "CapabilitySet":
+        """A multi-step (ReAct) agent: many LLM calls per task, so the
+        scheduler's quantum/preemption actually time-slices it (A1)."""
+        return cls(multi_step=True, max_tool_calls=max_tool_calls, max_tokens=8192)
 
 
 @dataclass
@@ -127,6 +134,10 @@ class AgentControlBlock:
     timeout_s: float = 30.0
 
     context_pages: list[ContextPage] = field(default_factory=list)
+
+    # Per-agent scratch state for the multi-step loop (step counter,
+    # observations). Loosely typed; only the executor/agent_loop touch it.
+    scratch: dict = field(default_factory=dict)
 
     # Runtime wiring: the kernel attaches *its* ContextPager here at spawn so the
     # executor uses per-kernel memory config (budget + policies + quota) instead

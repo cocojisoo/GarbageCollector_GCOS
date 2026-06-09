@@ -33,9 +33,11 @@ class FakeSandbox(SandboxRunner):
     canned_stdout: str = ""
     canned_exit: int = 0
     last_code: str = ""
+    last_cpu_shares = None
 
-    def run_python(self, code, *, timeout=5.0):
+    def run_python(self, code, *, timeout=5.0, cpu_shares=None):
         self.last_code = code
+        self.last_cpu_shares = cpu_shares
         return SandboxResult(
             stdout=self.canned_stdout,
             stderr="",
@@ -65,6 +67,18 @@ def test_happy_path_runs_code_and_merges_stdout():
     assert "[stdout]" in pcb.result
     assert "10" in pcb.result
     assert pcb.llm_calls_used == 1
+
+
+def test_coder_passes_priority_as_cpu_shares_to_sandbox():
+    """The agent's priority maps to the sandbox container's CFS weight, so a
+    higher-priority coder's code gets more CPU when sandboxes compete."""
+    from gcos.osprims.cgroup import priority_to_cpu_shares
+    pcb = mkpcb("print 1")
+    pcb.priority = 9
+    sb = FakeSandbox(canned_stdout="1\n")
+    run_coder_step(pcb, client=FakeClient("```python\nprint(1)\n```"), sandbox=sb)
+    assert sb.last_cpu_shares == priority_to_cpu_shares(9)
+    assert sb.last_cpu_shares > priority_to_cpu_shares(0)  # priority actually matters
 
 
 def test_prompt_jailbreak_tag_blocked_before_solar():

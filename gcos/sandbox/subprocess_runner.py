@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 from gcos.sandbox.runner import SandboxResult, SandboxRunner
 
@@ -46,7 +47,9 @@ class SubprocessSandboxRunner(SandboxRunner):
             _WARNED = True
         self.python_path = python_path or sys.executable
 
-    def run_python(self, code: str, *, timeout: float = 5.0) -> SandboxResult:
+    def run_python(self, code: str, *, timeout: float = 5.0,
+                   cpu_shares: Optional[int] = None) -> SandboxResult:
+        # cpu_shares is ignored: this weak fallback has no cgroup isolation.
         workdir = Path(tempfile.mkdtemp(prefix="gcos-sbx-"))
         script = workdir / "main.py"
         script.write_text(code, encoding="utf-8")
